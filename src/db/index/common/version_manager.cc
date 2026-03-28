@@ -21,7 +21,7 @@
 #include <mutex>
 #include <regex>
 #include <string>
-#include <proto/zvec.pb.h>
+#include <db/proto/zvec.pb.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/pattern/expected.hpp>
 #include <zvec/ailego/utility/string_helper.h>

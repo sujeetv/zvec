@@ -4,7 +4,7 @@ include(${PROJECT_ROOT_DIR}/cmake/option.cmake)
 cc_proto_library(
   NAME zvec_proto STATIC
   SRCS proto/*.proto
-  PROTOROOT ./
+  PROTOROOT ${PROJECT_ROOT_DIR}/src
 )
 
 cc_directory(common)
@@ -15,7 +15,7 @@ file(GLOB_RECURSE ALL_DB_SRCS *.cc *.c *.h)
 
 cc_library(
   NAME zvec_db STATIC STRICT SRCS_NO_GLOB
-  SRCS ${ALL_DB_SRCS} ${CMAKE_CURRENT_BINARY_DIR}/proto/zvec.pb.cc
+  SRCS ${ALL_DB_SRCS} ${CMAKE_CURRENT_BINARY_DIR}/db/proto/zvec.pb.cc
   INCS . ${CMAKE_CURRENT_BINARY_DIR}
   PUBINCS ${PROJECT_ROOT_DIR}/src/include
   LIBS 

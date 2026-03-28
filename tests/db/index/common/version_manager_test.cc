@@ -18,7 +18,7 @@
 #include <gtest/gtest.h>
 #include "db/common/file_helper.h"
 #include "db/index/common/meta.h"
-#include "proto/zvec.pb.h"
+#include "db/proto/zvec.pb.h"
 #include "zvec/db/schema.h"
 
 namespace zvec {
