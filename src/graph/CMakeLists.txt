@@ -16,9 +16,11 @@ target_include_directories(zvec_graph_proto PUBLIC
   ${CMAKE_BINARY_DIR}/src/db
 )
 
+file(GLOB_RECURSE ALL_GRAPH_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
+
 cc_library(
     NAME zvec_graph STATIC STRICT
-    SRCS *.cc
+    SRCS ${ALL_GRAPH_SRCS}
     INCS . ${PROJECT_ROOT_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}
     LIBS zvec_db zvec_graph_proto libprotobuf
     VERSION "${PROXIMA_ZVEC_VERSION}"

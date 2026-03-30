@@ -1,5 +1,20 @@
 include(${PROJECT_ROOT_DIR}/cmake/bazel.cmake)
 
+if(APPLE)
+  set(APPLE_FRAMEWORK_LIBS
+    -framework CoreFoundation
+    -framework CoreGraphics
+    -framework CoreData
+    -framework CoreText
+    -framework Security
+    -framework Foundation
+    -Wl,-U,_MallocExtension_ReleaseFreeMemory
+    -Wl,-U,_ProfilerStart
+    -Wl,-U,_ProfilerStop
+    -Wl,-U,_RegisterThriftProtocol
+  )
+endif()
+
 file(GLOB_RECURSE ALL_TEST_SRCS *_test.cc)
 
 foreach(CC_SRCS ${ALL_TEST_SRCS})
@@ -8,7 +23,20 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
       NAME ${CC_TARGET}
       STRICT
       LIBS zvec_graph zvec_graph_proto zvec_db libprotobuf
+        core_knn_flat
+        core_knn_flat_sparse
+        core_knn_hnsw
+        core_knn_hnsw_rabitq
+        core_knn_hnsw_sparse
+        core_knn_ivf
+        core_mix_reducer
+        core_metric
+        core_utility
+        core_quantizer
+        ${CMAKE_THREAD_LIBS_INIT}
+        ${CMAKE_DL_LIBS}
       SRCS ${CC_SRCS}
       INCS . ${PROJECT_ROOT_DIR}/src
+      LDFLAGS ${APPLE_FRAMEWORK_LIBS}
     )
 endforeach()
