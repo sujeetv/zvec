@@ -67,6 +67,20 @@ CollectionSchema ZvecStorage::BuildNodesSchema(const GraphSchema& schema) {
         kVectorPropertyPrefix + name, DataType::STRING, /*nullable=*/true));
   }
 
+  // System fields for mutation tracking.
+  cs.add_field(std::make_shared<FieldSchema>("_version", DataType::UINT64,
+                                             /*nullable=*/true));
+  cs.add_field(std::make_shared<FieldSchema>("_updated_at", DataType::UINT64,
+                                             /*nullable=*/true));
+
+  // Adjacency lists stored as array-of-string fields.
+  cs.add_field(std::make_shared<FieldSchema>("_neighbor_ids",
+                                             DataType::ARRAY_STRING,
+                                             /*nullable=*/true));
+  cs.add_field(std::make_shared<FieldSchema>("_neighbor_edge_ids",
+                                             DataType::ARRAY_STRING,
+                                             /*nullable=*/true));
+
   // zvec requires at least one vector field per collection. We use a small
   // placeholder that is always populated.
   cs.add_field(std::make_shared<FieldSchema>(
@@ -104,6 +118,12 @@ CollectionSchema ZvecStorage::BuildEdgesSchema(const GraphSchema& schema) {
     cs.add_field(std::make_shared<FieldSchema>(name, DataType::STRING,
                                                /*nullable=*/true));
   }
+
+  // System fields for mutation tracking.
+  cs.add_field(std::make_shared<FieldSchema>("_version", DataType::UINT64,
+                                             /*nullable=*/true));
+  cs.add_field(std::make_shared<FieldSchema>("_updated_at", DataType::UINT64,
+                                             /*nullable=*/true));
 
   // zvec requires at least one vector field per collection.
   cs.add_field(std::make_shared<FieldSchema>(
@@ -197,6 +217,15 @@ Doc ZvecStorage::NodeToDoc(const GraphNode& node) {
     doc.set<std::string>(kVectorPropertyPrefix + name, serialized);
   }
 
+  // System fields.
+  doc.set<uint64_t>("_version", node.version);
+  doc.set<uint64_t>("_updated_at", node.updated_at);
+
+  // Adjacency lists.
+  doc.set<std::vector<std::string>>("_neighbor_ids", node.neighbor_ids);
+  doc.set<std::vector<std::string>>("_neighbor_edge_ids",
+                                    node.neighbor_edge_ids);
+
   // Always provide the placeholder vector.
   doc.set<std::vector<float>>(kPlaceholderVectorField,
                               std::vector<float>(kPlaceholderVectorDim, 0.0f));
@@ -213,10 +242,28 @@ GraphNode ZvecStorage::DocToNode(const Doc& doc) {
     node.node_type = nt.value();
   }
 
+  // System fields.
+  auto ver = doc.get<uint64_t>("_version");
+  if (ver.has_value()) node.version = ver.value();
+
+  auto upd = doc.get<uint64_t>("_updated_at");
+  if (upd.has_value()) node.updated_at = upd.value();
+
+  // Adjacency lists.
+  auto nids = doc.get<std::vector<std::string>>("_neighbor_ids");
+  if (nids.has_value()) node.neighbor_ids = nids.value();
+
+  auto neids = doc.get<std::vector<std::string>>("_neighbor_edge_ids");
+  if (neids.has_value()) node.neighbor_edge_ids = neids.value();
+
+  // Internal system field names to exclude from user properties.
+  static const std::unordered_set<std::string> kNodeSystemFields = {
+      "node_type",          kPlaceholderVectorField, "_version",
+      "_updated_at",        "_neighbor_ids",         "_neighbor_edge_ids"};
+
   // Extract all string fields as properties (excluding system fields).
   for (const auto& field_name : doc.field_names()) {
-    if (field_name == "node_type") continue;
-    if (field_name == kPlaceholderVectorField) continue;
+    if (kNodeSystemFields.count(field_name) > 0) continue;
 
     auto str_val = doc.get<std::string>(field_name);
     if (!str_val.has_value()) continue;
@@ -255,6 +302,10 @@ Doc ZvecStorage::EdgeToDoc(const GraphEdge& edge) {
     doc.set<std::string>(key, value);
   }
 
+  // System fields.
+  doc.set<uint64_t>("_version", edge.version);
+  doc.set<uint64_t>("_updated_at", edge.updated_at);
+
   // Set the placeholder vector required by zvec.
   doc.set<std::vector<float>>(kPlaceholderVectorField,
                               std::vector<float>(kPlaceholderVectorDim, 0.0f));
@@ -278,10 +329,17 @@ GraphEdge ZvecStorage::DocToEdge(const Doc& doc) {
   auto dir = doc.get<bool>("directed");
   if (dir.has_value()) edge.directed = dir.value();
 
+  // System fields.
+  auto ver = doc.get<uint64_t>("_version");
+  if (ver.has_value()) edge.version = ver.value();
+
+  auto upd = doc.get<uint64_t>("_updated_at");
+  if (upd.has_value()) edge.updated_at = upd.value();
+
   // Extract remaining string fields as properties.
   static const std::unordered_set<std::string> kEdgeSystemFields = {
-      "source_id", "target_id", "edge_type", "directed",
-      kPlaceholderVectorField};
+      "source_id",  "target_id", "edge_type", "directed",
+      "_version",   "_updated_at", kPlaceholderVectorField};
 
   for (const auto& field_name : doc.field_names()) {
     if (kEdgeSystemFields.count(field_name) > 0) continue;
