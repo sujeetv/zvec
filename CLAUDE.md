@@ -53,6 +53,7 @@ cmake --build . --target unittest  # Run C++ tests
 - **Commits:** Conventional format: `type(scope): description`
   - Types: `feat`, `fix`, `docs`, `refactor`, `test`, `chore`
 - **Pre-commit hooks:** clang-format, ruff lint+format, gitleaks (secret scanning)
+- **GitHub issues/PRs:** Always create on the fork `sujeetv/zvec`, never on upstream `alibaba/zvec`
 
 ## Architecture
 

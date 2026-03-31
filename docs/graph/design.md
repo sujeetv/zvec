@@ -782,7 +782,115 @@ This is critical for debugging "why did the agent choose the wrong tables?" — 
 
 ---
 
-## 12. Open Questions
+## 12. Traversal Algorithm Analysis
+
+### 12.1 Current Implementation
+
+The v0.1 traversal engine uses **basic BFS with per-node storage lookups**:
+
+```
+For each hop (1..max_depth):
+  For each node in frontier:
+    Read adjacency list from storage (RocksDB point lookup)
+    Batch-fetch edge documents, apply in-memory filter
+    Batch-fetch neighbor nodes, apply in-memory filter
+    Check max_nodes budget, update visited set
+```
+
+- **Complexity:** O(V + E) per traversal, with per-node I/O
+- **Parallelism:** None — single-threaded BFS
+- **Filter execution:** Naive string parsing per node (`"field = 'value'"`)
+- **Cycle detection:** Hash set of visited node IDs
+
+This is correct and sufficient for the GraphRAG use case: shallow traversals (2-5 hops) over small neighborhoods (< 1000 nodes). A typical query (3 seeds, 2-hop, max_nodes=100) touches ~200 nodes with ~200 RocksDB reads, completing in **< 10ms**. The LLM inference that follows takes 500ms-5s, so traversal is not the bottleneck.
+
+### 12.2 State-of-the-Art Comparison
+
+| Approach | Key Insight | Performance |
+|----------|------------|-------------|
+| **SuiteSparse:GraphBLAS + LAGraph** | Graph ops = sparse linear algebra. BFS = sparse matrix-vector multiply (SpMV). Visited set = complement mask. | Billions of edges in seconds, single machine |
+| **Ligra / Julienne** | Direction-optimized BFS: push (sparse frontier) vs pull (dense frontier) switching based on frontier/graph ratio | Near-optimal work for any frontier size |
+| **Gunrock** | GPU-accelerated graph analytics via massive parallelism | Billions of edges/second on GPU |
+| **KuzuDB** | Worst-case optimal joins for multi-hop pattern matching, compiled to vectorized relational operators | Embedded, competitive with Neo4j |
+| **Neo4j / Memgraph** | Morsel-driven parallelism, columnar adjacency, JIT-compiled queries | Production-grade, millions of edges |
+
+The GraphBLAS insight is particularly elegant: a k-hop BFS is just `frontier = A * frontier` repeated k times, where A is the adjacency matrix in CSR format and the multiply uses a semiring (AND/OR for reachability, min/+ for shortest path, etc.). The visited set becomes a complement mask on SpMV — zero-copy, cache-friendly, SIMD-vectorized.
+
+### 12.3 Gap Analysis
+
+| Aspect | v0.1 BFS | SOTA |
+|--------|----------|------|
+| Traversal depth | 2-5 hops | Arbitrary |
+| Graph size | < 100K nodes | Billions of edges |
+| Parallelism | None | Thread/GPU parallel |
+| Memory layout | RocksDB point lookups | CSR/columnar, cache-aware |
+| Filter execution | String parsing per node | Compiled/vectorized predicates |
+| Direction optimization | No | Push/pull switching |
+
+### 12.4 When SOTA Becomes Necessary
+
+The v0.1 approach breaks down in these scenarios:
+
+1. **Deep traversals (10+ hops)** — per-node I/O model degrades; need bulk adjacency loading or GraphBLAS-style SpMV
+2. **Large dense neighborhoods (10K+ edges per node)** — exhaustive expansion is wasteful; need beam pruning or probabilistic sampling
+3. **Complex filter predicates** — string parsing per node is O(n) in predicate length; need compiled filter expressions
+4. **Analytical workloads** — PageRank, community detection, etc. require full-graph iteration, not local BFS
+
+### 12.5 Incremental Optimization Path
+
+These can be adopted independently as scale demands:
+
+1. **Batch adjacency loading** — `RocksDB::MultiGet` for the entire frontier instead of per-node `Get`. Expected: 3-5x throughput improvement on large frontiers.
+2. **Compiled filters** — pre-parse filter expressions into a predicate tree at query construction time, evaluate without string allocation per node.
+3. **Parallel frontier expansion** — partition frontier across threads, each expands independently, merge results. Lock-free with per-thread visited sets merged via atomic union.
+4. **GraphBLAS backend** — for analytical workloads, maintain a CSR adjacency matrix alongside the property store. Use GraphBLAS SpMV for structural traversal, point lookups for property hydration. The two representations stay in sync via the mutation engine.
+5. **Direction-optimized BFS** — when frontier exceeds ~10% of graph size, switch from push (iterate frontier, check neighbors) to pull (iterate all vertices, check if any frontier neighbor exists). Requires maintaining both CSR and CSC formats.
+
+---
+
+## 13. Concurrency Model
+
+### 13.1 Current Implementation
+
+The v0.1 concurrency model is simple:
+
+- **MutationEngine:** A single `std::mutex` serializes all write operations. This exists because edge mutation is a 3-write operation (edge doc + source adjacency + target adjacency). Without the lock, concurrent mutations to the same node trigger a read-modify-write race: both threads read the adjacency list, append their entry, and write back — losing one update.
+
+- **TraversalEngine:** No locking. Reads are naturally concurrent. Multiple agents can traverse simultaneously without contention.
+
+- **RocksDB layer:** Provides snapshot isolation for reads, so a traversal always sees a consistent state even if a mutation is in flight.
+
+### 13.2 Scaling Limitations
+
+At 100K concurrent agents:
+
+- **Write throughput:** All mutations funnel through one mutex. If agents are frequently adding learned edges or updating confidence scores, they queue up. With ~50μs per write and the lock held for ~150μs per edge mutation (3 writes), theoretical max is ~6,600 edge mutations/second.
+
+- **Write-read latency:** Traversals aren't blocked by the mutex, but they might read slightly stale adjacency lists (snapshot isolation means they see the state at read-start, not real-time). This is acceptable for GraphRAG — the next traversal will see the updated state.
+
+### 13.3 Future Concurrency Approaches
+
+In order of implementation complexity:
+
+1. **Per-node locking** — Replace the single mutex with a lock table keyed by node ID. Mutations only lock the nodes they touch. Two mutations to different parts of the graph proceed in parallel. Estimated effort: moderate. Expected improvement: proportional to graph size / working set.
+
+2. **Write batching with WAL** — Queue mutations in a write-ahead log and flush periodically (e.g., every 10ms or every 100 mutations). Amortizes the lock acquisition cost. Good for bursty writes from many agents. Estimated effort: moderate.
+
+3. **Lock-free adjacency with CAS** — Use compare-and-swap on adjacency list updates. Read current list, compute new list, CAS-write. Retry on conflict. Requires adjacency lists stored as immutable versioned snapshots. Estimated effort: high. Only needed if per-node locking is insufficient.
+
+4. **Sharded graph engines** — Partition the graph across N `GraphEngine` instances, each with its own storage and mutex. Route mutations by source node hash. Cross-shard edges require a 2PC protocol. Estimated effort: high. This is the path to distributed graph.
+
+### 13.4 Recommended Approach for 100K Agents
+
+For the typical GraphRAG workload (bulk load at build time, infrequent learned edge writes, read-heavy traversals):
+
+- The single mutex is sufficient through ~10K agents
+- Per-node locking + write batching gets to ~100K agents
+- Sharded engines only needed if write volume exceeds what a single RocksDB instance can handle (~100K writes/second)
+
+---
+
+## 14. Open Questions
 
 1. **Bulk loading API.** Should there be a batch `add_nodes` / `add_edges` that optimizes for initial graph population (skip adjacency updates until flush)?
 2. **Schema migration tooling.** What does `alter_node_type` or `add_property_to_existing_type` look like operationally?
