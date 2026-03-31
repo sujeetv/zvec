@@ -88,8 +88,22 @@ from .typing import (
 )
 from .typing.enum import LogLevel, LogType
 
+# —— Graph ——
+from .graph import (
+    EdgeConstraint,
+    EdgeType,
+    Graph,
+    GraphEdge,
+    GraphNode,
+    GraphSchema,
+    NodeType,
+    PropertyDef,
+    Subgraph,
+    VectorDef,
+)
+
 # —— lifecycle ——
-from .zvec import create_and_open, init, open
+from .zvec import create_and_open, create_graph, init, open, open_graph
 
 # ==============================
 # Public interface declaration
@@ -97,8 +111,10 @@ from .zvec import create_and_open, init, open
 __all__ = [
     # Zvec functions
     "create_and_open",
+    "create_graph",
     "init",
     "open",
+    "open_graph",
     # Core classes
     "Collection",
     "Doc",
@@ -148,6 +164,17 @@ __all__ = [
     "LogType",
     "Status",
     "StatusCode",
+    # Graph
+    "Graph",
+    "GraphSchema",
+    "NodeType",
+    "EdgeType",
+    "EdgeConstraint",
+    "PropertyDef",
+    "VectorDef",
+    "GraphNode",
+    "GraphEdge",
+    "Subgraph",
     # Tools
     "require_module",
 ]

@@ -21,7 +21,7 @@ from .model import Collection
 from .model.param import CollectionOption
 from .model.schema import CollectionSchema
 
-__all__ = ["create_and_open", "init", "open"]
+__all__ = ["create_and_open", "create_graph", "init", "open", "open_graph"]
 
 from .typing.enum import LogLevel, LogType
 
@@ -224,3 +224,39 @@ def open(path: str, option: CollectionOption = CollectionOption()) -> Collection
     """
     _collection = _Collection.Open(path, option)
     return Collection._from_core(_collection)
+
+
+def create_graph(
+    path: str,
+    schema: "GraphSchema",
+) -> "Graph":
+    """Create a new property graph at the given path.
+
+    Convenience wrapper around :meth:`Graph.create`.
+
+    Args:
+        path: Filesystem path for graph storage.
+        schema: Graph schema defining node/edge types.
+
+    Returns:
+        A new Graph instance.
+    """
+    from .graph import Graph
+
+    return Graph.create(path, schema)
+
+
+def open_graph(path: str) -> "Graph":
+    """Open an existing property graph from disk.
+
+    Convenience wrapper around :meth:`Graph.open`.
+
+    Args:
+        path: Filesystem path of the graph.
+
+    Returns:
+        An opened Graph instance.
+    """
+    from .graph import Graph
+
+    return Graph.open(path)
