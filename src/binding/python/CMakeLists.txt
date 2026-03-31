@@ -10,6 +10,7 @@ set(SRC_LISTS
         binding.cc
         model/python_collection.cc
         model/python_doc.cc
+        model/python_graph.cc
         model/param/python_param.cc
         model/schema/python_schema.cc
         model/common/python_config.cc
@@ -34,6 +35,8 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
             $<TARGET_FILE:core_quantizer_static>
             -Wl,--no-whole-archive
             zvec_db
+            zvec_graph
+            zvec_graph_proto
     )
     target_link_options(_zvec PRIVATE
             "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/exports.map"
@@ -52,10 +55,12 @@ elseif (APPLE)
             -Wl,-force_load,$<TARGET_FILE:core_utility_static>
             -Wl,-force_load,$<TARGET_FILE:core_quantizer_static>
             zvec_db
+            zvec_graph
+            zvec_graph_proto
     )
     target_link_libraries(_zvec PRIVATE
             -Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/exports.mac
     )
 endif ()
 
-target_include_directories(_zvec PRIVATE ${PYBIND11_INCLUDE_DIR} ${PROJECT_ROOT_DIR}/src ${PROJECT_ROOT_DIR}/src/binding/python/include)
+target_include_directories(_zvec PRIVATE ${PYBIND11_INCLUDE_DIR} ${PROJECT_ROOT_DIR}/src ${PROJECT_ROOT_DIR}/src/binding/python/include ${CMAKE_BINARY_DIR}/src/graph ${CMAKE_BINARY_DIR}/src/db)

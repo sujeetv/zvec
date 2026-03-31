@@ -11,25 +11,20 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+#pragma once
 
-#include "python_collection.h"
-#include "python_config.h"
-#include "python_doc.h"
-#include "python_graph.h"
-#include "python_param.h"
-#include "python_schema.h"
-#include "python_type.h"
+#include <pybind11/pybind11.h>
+
+namespace py = pybind11;
 
 namespace zvec {
-PYBIND11_MODULE(_zvec, m) {
-  m.doc() = "Zvec core module";
 
-  ZVecPyTyping::Initialize(m);
-  ZVecPyParams::Initialize(m);
-  ZVecPySchemas::Initialize(m);
-  ZVecPyConfig::Initialize(m);
-  ZVecPyDoc::Initialize(m);
-  ZVecPyCollection::Initialize(m);
-  ZVecPyGraph::Initialize(m);
-}
+class ZVecPyGraph {
+ public:
+  ZVecPyGraph() = delete;
+
+ public:
+  static void Initialize(py::module_& m);
+};
+
 }  // namespace zvec
