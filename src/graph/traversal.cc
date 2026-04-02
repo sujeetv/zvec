@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <queue>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace zvec {
@@ -91,16 +92,19 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
 
   std::unordered_set<std::string> visited;
   std::unordered_set<std::string> collected_edge_ids;
+  std::unordered_map<std::string, GraphNode> node_cache;
 
-  // 2. Fetch seed nodes
-  auto seed_result = storage_->FetchNodes(params.start_ids);
+  // 2. Fetch seed nodes (lite — skip vector deserialization)
+  auto seed_result = storage_->FetchNodesLite(params.start_ids);
   if (!seed_result.has_value()) return result;
 
   std::vector<std::string> frontier;
+  frontier.reserve(params.start_ids.size());
   for (auto& node : seed_result.value()) {
     if (visited.count(node.id)) continue;
     visited.insert(node.id);
     frontier.push_back(node.id);
+    node_cache[node.id] = node;
     result.nodes.push_back(std::move(node));
   }
 
@@ -122,13 +126,34 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
   for (int hop = 1; hop <= params.max_depth; ++hop) {
     if (frontier.empty()) break;
 
-    // Fetch current frontier nodes to get adjacency lists
-    auto frontier_result = storage_->FetchNodes(frontier);
-    if (!frontier_result.has_value()) break;
+    // Resolve frontier nodes from cache, fetch any cache misses.
+    std::vector<GraphNode> frontier_nodes;
+    frontier_nodes.reserve(frontier.size());
+    {
+      std::vector<std::string> missing_ids;
+      for (const auto& id : frontier) {
+        auto it = node_cache.find(id);
+        if (it != node_cache.end()) {
+          frontier_nodes.push_back(it->second);
+        } else {
+          missing_ids.push_back(id);
+        }
+      }
+      if (!missing_ids.empty()) {
+        auto fetched = storage_->FetchNodesLite(missing_ids);
+        if (fetched.has_value()) {
+          for (auto& n : fetched.value()) {
+            node_cache[n.id] = n;
+            frontier_nodes.push_back(std::move(n));
+          }
+        }
+      }
+    }
 
     // Collect candidate (neighbor_id, edge_id) pairs
     std::vector<std::string> candidate_edge_ids;
-    for (const auto& node : frontier_result.value()) {
+    candidate_edge_ids.reserve(frontier_nodes.size() * 8);
+    for (const auto& node : frontier_nodes) {
       for (size_t i = 0; i < node.neighbor_ids.size(); ++i) {
         const auto& neighbor_id = node.neighbor_ids[i];
         if (visited.count(neighbor_id)) continue;
@@ -149,7 +174,9 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
 
     // Apply edge filter
     std::vector<GraphEdge> passing_edges;
+    passing_edges.reserve(edges_result.value().size());
     std::vector<std::string> target_node_ids;
+    target_node_ids.reserve(edges_result.value().size());
 
     for (auto& edge : edges_result.value()) {
       if (has_edge_filter &&
@@ -190,8 +217,8 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
                                                    target_node_ids.end());
     target_node_ids.assign(unique_targets.begin(), unique_targets.end());
 
-    // Batch-fetch target nodes
-    auto nodes_result = storage_->FetchNodes(target_node_ids);
+    // Batch-fetch target nodes (lite — skip vector deserialization)
+    auto nodes_result = storage_->FetchNodesLite(target_node_ids);
     if (!nodes_result.has_value()) {
       // Still add the edges
       for (auto& e : passing_edges) result.edges.push_back(std::move(e));
@@ -200,6 +227,7 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
 
     // Apply node filter and budget
     std::vector<std::string> new_frontier;
+    new_frontier.reserve(nodes_result.value().size());
     std::vector<GraphEdge> accepted_edges;
 
     for (auto& node : nodes_result.value()) {
@@ -220,6 +248,7 @@ Subgraph TraversalEngine::Traverse(const TraversalParams& params) const {
 
       visited.insert(node.id);
       new_frontier.push_back(node.id);
+      node_cache[node.id] = node;
       result.nodes.push_back(std::move(node));
     }
 

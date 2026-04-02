@@ -17,7 +17,7 @@
 #include <pybind11/stl.h>
 
 #include "graph/graph_edge.h"
-#include "graph/graph_engine.h"
+#include "graph/graph_collection.h"
 #include "graph/graph_node.h"
 #include "graph/graph_schema.h"
 #include "graph/subgraph.h"
@@ -232,75 +232,83 @@ void ZVecPyGraph::Initialize(py::module_& m) {
       .def_readwrite("edge_filter", &TraversalParams::edge_filter)
       .def_readwrite("node_filter", &TraversalParams::node_filter);
 
-  // --- GraphEngine ---
-  py::class_<GraphEngine>(m, "_GraphEngine")
+  // --- GraphCollection ---
+  py::class_<GraphCollection>(m, "_GraphCollection")
       .def_static(
           "Create",
           [](const std::string& path, const GraphSchema& schema) {
-            auto engine = GraphEngine::Create(path, schema);
-            if (!engine) {
+            auto gc = GraphCollection::Create(path, schema);
+            if (!gc) {
               throw std::runtime_error(
                   "Failed to create graph at '" + path + "'");
             }
-            return engine;
+            return gc;
           },
           py::arg("path"), py::arg("schema"),
           py::call_guard<py::gil_scoped_release>())
       .def_static(
           "Open",
           [](const std::string& path) {
-            auto engine = GraphEngine::Open(path);
-            if (!engine) {
+            auto gc = GraphCollection::Open(path);
+            if (!gc) {
               throw std::runtime_error(
                   "Failed to open graph at '" + path + "'");
             }
-            return engine;
+            return gc;
           },
           py::arg("path"), py::call_guard<py::gil_scoped_release>())
       .def(
-          "Destroy", [](GraphEngine& self) { self.Destroy(); },
+          "Destroy", [](GraphCollection& self) { self.Destroy(); },
           py::call_guard<py::gil_scoped_release>())
       .def(
-          "Repair",
-          [](GraphEngine& self) {
-            auto s = self.Repair();
+          "Flush",
+          [](GraphCollection& self) {
+            auto s = self.Flush();
             throw_graph_error(s);
           },
           py::call_guard<py::gil_scoped_release>())
       .def(
           "GetSchema",
-          [](const GraphEngine& self) -> const GraphSchema& {
+          [](const GraphCollection& self) -> const GraphSchema& {
             return self.GetSchema();
           },
           py::return_value_policy::reference_internal)
       .def(
           "AddNode",
-          [](GraphEngine& self, const GraphNode& node) {
+          [](GraphCollection& self, const GraphNode& node) {
             auto s = self.AddNode(node);
             throw_graph_error(s);
           },
           py::arg("node"), py::call_guard<py::gil_scoped_release>())
       .def(
           "RemoveNode",
-          [](GraphEngine& self, const std::string& node_id) {
+          [](GraphCollection& self, const std::string& node_id) {
             auto s = self.RemoveNode(node_id);
             throw_graph_error(s);
           },
           py::arg("node_id"), py::call_guard<py::gil_scoped_release>())
       .def(
           "UpdateNode",
-          [](GraphEngine& self, const std::string& node_id,
+          [](GraphCollection& self, const std::string& node_id,
              const std::unordered_map<std::string, std::string>& properties) {
             auto s = self.UpdateNode(node_id, properties);
             throw_graph_error(s);
           },
           py::arg("node_id"), py::arg("properties"),
           py::call_guard<py::gil_scoped_release>())
-      .def("FetchNodes", &GraphEngine::FetchNodes, py::arg("ids"),
+      .def("FetchNodes", &GraphCollection::FetchNodes, py::arg("ids"),
            py::call_guard<py::gil_scoped_release>())
       .def(
+          "FilterNodes",
+          [](GraphCollection& self, const std::string& filter_expr,
+             int limit) {
+            return self.FilterNodes(filter_expr, limit);
+          },
+          py::arg("filter_expr"), py::arg("limit") = 1000,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
           "AddEdge",
-          [](GraphEngine& self, const std::string& source_id,
+          [](GraphCollection& self, const std::string& source_id,
              const std::string& target_id, const std::string& edge_type,
              const std::unordered_map<std::string, std::string>& properties) {
             auto s = self.AddEdge(source_id, target_id, edge_type, properties);
@@ -312,15 +320,50 @@ void ZVecPyGraph::Initialize(py::module_& m) {
           py::call_guard<py::gil_scoped_release>())
       .def(
           "RemoveEdge",
-          [](GraphEngine& self, const std::string& edge_id) {
+          [](GraphCollection& self, const std::string& edge_id) {
             auto s = self.RemoveEdge(edge_id);
             throw_graph_error(s);
           },
           py::arg("edge_id"), py::call_guard<py::gil_scoped_release>())
-      .def("FetchEdges", &GraphEngine::FetchEdges, py::arg("ids"),
+      .def(
+          "UpdateEdge",
+          [](GraphCollection& self, const std::string& edge_id,
+             const std::unordered_map<std::string, std::string>& properties) {
+            auto s = self.UpdateEdge(edge_id, properties);
+            throw_graph_error(s);
+          },
+          py::arg("edge_id"), py::arg("properties"),
+          py::call_guard<py::gil_scoped_release>())
+      .def("FetchEdges", &GraphCollection::FetchEdges, py::arg("ids"),
            py::call_guard<py::gil_scoped_release>())
-      .def("Traverse", &GraphEngine::Traverse, py::arg("params"),
-           py::call_guard<py::gil_scoped_release>());
+      .def(
+          "FilterEdges",
+          [](GraphCollection& self, const std::string& filter_expr,
+             int limit) {
+            return self.FilterEdges(filter_expr, limit);
+          },
+          py::arg("filter_expr"), py::arg("limit") = 1000,
+          py::call_guard<py::gil_scoped_release>())
+      .def("Traverse", &GraphCollection::Traverse, py::arg("params"),
+           py::call_guard<py::gil_scoped_release>())
+      .def(
+          "CreateIndex",
+          [](GraphCollection& self, const std::string& entity,
+             const std::string& field) {
+            auto s = self.CreateIndex(entity, field);
+            throw_graph_error(s);
+          },
+          py::arg("entity"), py::arg("field"),
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "DropIndex",
+          [](GraphCollection& self, const std::string& entity,
+             const std::string& field) {
+            auto s = self.DropIndex(entity, field);
+            throw_graph_error(s);
+          },
+          py::arg("entity"), py::arg("field"),
+          py::call_guard<py::gil_scoped_release>());
 }
 
 }  // namespace zvec

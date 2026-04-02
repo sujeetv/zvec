@@ -1,7 +1,7 @@
 # Property Graph Engine for zvec
 
-**Status:** Draft
-**Date:** 2026-03-27
+**Status:** Active
+**Date:** 2026-03-31
 **Audience:** Principal/Staff Engineers, Architects
 
 ---
@@ -27,9 +27,9 @@ The primary consumer is **AI agents** — potentially hundreds or thousands conc
 
 1. **General-purpose property graph.** Not tied to any domain. Data catalogs, knowledge graphs, org charts, dependency graphs — all valid.
 2. **Schema as contract.** A schema layer sits between the domain and the generic graph engine. It defines legal node types, edge types, properties, and constraints.
-3. **Embeddings are a first-class concern.** Both nodes and edges can carry vector fields. What gets embedded is a domain decision — the engine has no opinion.
+3. **Embeddings are separate.** Vector search lives in standard zvec Collections. The graph engine stores structure and properties; embedding algorithms create companion collections independently.
 4. **Agent-optimized.** Structured responses, tool-shaped APIs, high concurrency, low latency.
-5. **Storage abstraction from day one.** The graph engine talks to a storage interface, not directly to zvec internals. Today: in-process zvec collections. Tomorrow: cloud/remote store.
+5. **KV-native storage.** The graph engine uses a direct RocksDB KV store optimized for point lookups, traversals, and concurrent agent reads. No Arrow IPC, no segment-level locks.
 6. **C++ core, thin Python API.** Graph logic (traversal, mutation, atomicity, concurrency) lives in C++. Python is a thin binding layer for API ergonomics and agent integration.
 
 ---
@@ -41,7 +41,6 @@ This is a **property graph** in the classic sense:
 - **Nodes** have a type and arbitrary key-value properties
 - **Edges** have a type, direction, and arbitrary key-value properties
 - Properties are typed, filterable, and indexable
-- Both nodes and edges can carry vector fields
 
 ### 3.1 Node
 
@@ -49,22 +48,24 @@ This is a **property graph** in the classic sense:
 |-------|------|-------------|
 | `id` | `str` | Unique node identifier |
 | `node_type` | `str` | Schema-defined type (e.g., `"table"`, `"column"`) |
-| `properties` | `dict[str, Any]` | Schema-defined typed properties |
-| `vectors` | `dict[str, list]` | Schema-defined vector fields (optional) |
-| `neighbor_ids` | `ARRAY_STRING` | Adjacency list — IDs of connected nodes |
-| `neighbor_edge_ids` | `ARRAY_STRING` | Parallel array — edge ID for each neighbor |
+| `properties` | `dict[str, str]` | Schema-defined typed properties |
+| `neighbor_ids` | `list[str]` | Adjacency list — IDs of connected nodes |
+| `neighbor_edge_ids` | `list[str]` | Parallel array — edge ID for each neighbor |
+| `version` | `uint64` | Monotonically increasing, bumped on every mutation |
+| `updated_at` | `uint64` | Timestamp of last mutation (epoch ms) |
 
 ### 3.2 Edge
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | `str` | Deterministic: `"{source_id}:{edge_type}:{target_id}"` |
+| `id` | `str` | Deterministic: `"{source_id}--{edge_type}--{target_id}"` |
 | `source_id` | `str` | Origin node ID |
 | `target_id` | `str` | Destination node ID |
 | `edge_type` | `str` | Schema-defined type (e.g., `"foreign_key"`, `"learned"`) |
 | `directed` | `bool` | Directional or bidirectional |
-| `properties` | `dict[str, Any]` | Schema-defined typed properties |
-| `vectors` | `dict[str, list]` | Schema-defined vector fields (optional) |
+| `properties` | `dict[str, str]` | Schema-defined typed properties |
+| `version` | `uint64` | Monotonically increasing |
+| `updated_at` | `uint64` | Timestamp of last mutation (epoch ms) |
 
 ### 3.3 Property Types
 
@@ -76,60 +77,200 @@ Same as zvec's scalar types — no new type system:
 | Float | `FLOAT`, `DOUBLE` |
 | Text | `STRING` |
 | Boolean | `BOOL` |
-| Arrays | `ARRAY_INT32`, `ARRAY_INT64`, `ARRAY_UINT32`, `ARRAY_UINT64`, `ARRAY_FLOAT`, `ARRAY_DOUBLE`, `ARRAY_STRING`, `ARRAY_BOOL` |
 
 ### 3.4 Adjacency List Design
 
 - `neighbor_ids` and `neighbor_edge_ids` are parallel arrays — index `i` in both refers to the same relationship
 - **Undirected edges:** both endpoints get a neighbor entry
 - **Directed edges:** both endpoints still get the entry (enabling traversal in either direction), but the edge document records the actual direction via `source_id`/`target_id`
-- This is the **hybrid model (C)**: adjacency on nodes for fast traversal, edge documents for properties/embeddings/metadata
+- This is the **hybrid model**: adjacency on nodes for fast traversal, edge documents for properties/embeddings/metadata
 
 ---
 
-## 4. Storage Mapping
+## 4. Storage Architecture
 
-The graph engine maps the property graph onto **two zvec collections** internally:
+### 4.1 Graph Collection with KV-Backed Storage
 
-| Graph Concept | zvec Mapping |
-|---------------|-------------|
-| Node properties | Scalar fields on nodes collection |
-| Node vectors | Vector fields on nodes collection |
-| Edge properties | Scalar fields on edges collection |
-| Edge vectors | Vector fields on edges collection |
-| Adjacency lists | `ARRAY_STRING` fields on node documents |
-| Structural lookups | Auto-created inverted indexes (see 4.1) |
+The graph engine uses a **Graph Collection** as a new collection type in zvec, backed by a direct RocksDB KV store optimized for point lookups, traversals, and concurrent agent reads.
 
-### 4.1 Indexing Strategy
-
-**Auto-created at graph initialization** (structural — required for traversal):
-
-| Collection | Field | Reason |
-|------------|-------|--------|
-| Nodes | `node_type` | Filter by type during search/traversal |
-| Edges | `source_id` | Outgoing traversal |
-| Edges | `target_id` | Incoming traversal |
-| Edges | `edge_type` | Filter by relationship type |
-
-**User-created on demand** (property fields and vectors):
-
-No property fields or vector fields are indexed by default. Users create indexes when needed, same as zvec today:
-
-```python
-graph.create_index("nodes", "department", InvertIndexParam())
-graph.create_index("edges", "confidence", InvertIndexParam(enable_range_optimization=True))
-graph.create_index("nodes", "description_emb", HnswIndexParam(ef_construction=200))
+```
+GraphCollection (public API)
+  |
+  +-- graph_meta.pb              schema + metadata (protobuf file)
+  |
+  +-- GraphKVStore               ALL graph data (primary store)
+  |     |-- RocksDB instance
+  |     |     |-- CF "nodes"     key=node_id   val=GraphNodeProto
+  |     |     |-- CF "edges"     key=edge_id   val=GraphEdgeProto
+  |     |     |-- CF "idx:..."   secondary indexes (inverted)
+  |     |     +-- CF "default"   RocksDB internal
+  |     +-- supports: MultiGet, WriteBatch, concurrent lock-free reads
+  |
+  +-- MutationEngine             writes to GraphKVStore
+  +-- TraversalEngine            reads from GraphKVStore
+  +-- GraphSchema                validates types + constraints (loaded from graph_meta.pb)
 ```
 
-This keeps the default footprint small and lets the domain decide what's worth indexing.
+When an embedding algorithm (e.g., GraphSAGE) later produces vectors, it creates a standard zvec Collection separately and stores vectors there. **No vectors in the graph store.** The agent orchestrates the two-phase lookup: vector search for seed IDs, then graph traversal.
+
+### 4.2 Why RocksDB (not zvec Collections)
+
+The graph engine previously used zvec Collections (Arrow IPC columnar files) for storage. This was a poor fit:
+
+| Threads | Throughput (1-hop) | p50 latency | Scaling factor |
+|---------|--------------------|-------------|----------------|
+| 1       | 50 trav/s          | 20ms        | 1.00x          |
+| 4       | 39 trav/s          | 77ms        | 0.20x          |
+| 16      | 52 trav/s          | 262ms       | 0.07x          |
+| 32      | 50 trav/s          | 541ms       | 0.03x          |
+
+**Root cause**: `SegmentImpl::Fetch()` acquires an exclusive `std::mutex` (`seg_mtx_`), serializing all concurrent reads within a segment. Since a 10K-node graph fits in a single segment, throughput is capped regardless of thread count.
+
+RocksDB provides lock-free concurrent reads via internal MVCC snapshots, true atomic writes via WriteBatch, and native secondary indexes via column families + merge operators.
+
+### 4.3 Protobuf Serialization
+
+Data is serialized as protobuf for RocksDB value encoding:
+
+```protobuf
+message GraphNodeProto {
+  string id = 1;
+  string node_type = 2;
+  map<string, string> properties = 3;
+  repeated string neighbor_ids = 4;
+  repeated string neighbor_edge_ids = 5;
+  uint64 version = 6;
+  uint64 updated_at = 7;
+}
+
+message GraphEdgeProto {
+  string id = 1;
+  string source_id = 2;
+  string target_id = 3;
+  string edge_type = 4;
+  bool directed = 5;
+  map<string, string> properties = 6;
+  uint64 version = 7;
+  uint64 updated_at = 8;
+}
+
+message IndexEntry {
+  repeated string ids = 1;
+}
+```
+
+**Why protobuf?** Schema evolution. When we add fields later (edge weights, labels), protobuf handles forward/backward compatibility. Serialization cost (~1us per node) is negligible vs RocksDB read (~10-50us).
+
+### 4.4 Disk Layout
+
+```
+graph_path/
+  graph_meta.pb              (schema + metadata protobuf)
+  kv/                        (GraphKVStore — single RocksDB instance)
+    LOCK
+    CURRENT
+    MANIFEST-*
+    OPTIONS-*
+    *.sst                    (all CFs: nodes, edges, indexes)
+    *.log                    (WAL files)
+```
+
+### 4.5 RocksDB Configuration
+
+```
+Column families: "default", "nodes", "edges", "idx:nodes:node_type",
+                 "idx:edges:source_id", "idx:edges:target_id",
+                 "idx:edges:edge_type", plus user-created indexes
+Bloom filter:    10 bits/key
+Compression:     LZ4
+Block cache:     64MB shared LRU
+WAL:             enabled
+Merge operator:  custom IndexMergeOperator for index CFs
+```
 
 ---
 
-## 5. Graph Schema
+## 5. Secondary Indexes
+
+### 5.1 Design
+
+Secondary indexes are inverted: `field_value → list of entity IDs`.
+
+Stored in a dedicated RocksDB column family per index:
+
+```
+CF "idx:nodes:node_type"
+  key = "merchant"      → IndexEntry{ids: ["m1", "m2", "m3", ...]}
+  key = "customer"      → IndexEntry{ids: ["c1", "c2", ...]}
+
+CF "idx:edges:source_id"
+  key = "merchant_42"   → IndexEntry{ids: ["e1", "e2", "e3"]}
+
+CF "idx:edges:edge_type"
+  key = "settled_at"    → IndexEntry{ids: ["e1", "e5", ...]}
+
+CF "idx:nodes:name"     (user-created)
+  key = "neodb.customers" → IndexEntry{ids: ["t1"]}
+```
+
+### 5.2 Auto-created indexes (always present)
+
+| Collection | Field       | Purpose                              |
+|------------|-------------|--------------------------------------|
+| nodes      | node_type   | Filter by type                       |
+| edges      | source_id   | Find edges from a source node        |
+| edges      | target_id   | Find edges to a target node          |
+| edges      | edge_type   | Filter edges by type                 |
+
+### 5.3 User-created indexes
+
+Users can add indexes on any property field:
+
+```cpp
+engine.CreateIndex("nodes", "name");
+engine.CreateIndex("nodes", "risk_score");
+engine.CreateIndex("edges", "currency");
+```
+
+### 5.4 Filter execution
+
+```
+FilterNodes("node_type = 'table' AND name = 'neodb.customers'")
+
+  1. Lookup CF "idx:nodes:node_type", key "table"
+     → ids_a = {"t1", "t2", "t3", ...}
+
+  2. Lookup CF "idx:nodes:name", key "neodb.customers"
+     → ids_b = {"t1"}
+
+  3. Intersect: result = ids_a ∩ ids_b = {"t1"}
+
+  4. Fetch full nodes: kv_store_->GetNodes({"t1"})
+     → RocksDB MultiGet on "nodes" CF
+```
+
+For non-indexed fields, fall back to scan + filter over the relevant CF.
+
+### 5.5 Index maintenance
+
+Indexes are updated synchronously within the same `WriteBatch` as the primary data. Using RocksDB `Merge` operator for index updates avoids read-modify-write:
+
+```
+WriteBatch:
+  Put(nodes_cf, "merchant_42", serialized_proto)           // primary
+  Merge(idx_node_type_cf, "merchant", add("merchant_42"))  // index update
+  Merge(idx_name_cf, "Acme Corp", add("merchant_42"))      // index update
+```
+
+The `IndexMergeOperator` encodes operands as `[1 byte op_type][entity_id]` — kOpAdd (0x01) or kOpRemove (0x02). On compaction, it deserializes the existing `IndexEntry`, applies all ADD/REMOVE operands, and serializes back.
+
+---
+
+## 6. Graph Schema
 
 The schema layer validates all mutations and defines the structure of the graph.
 
-### 5.1 Schema Definition
+### 6.1 Schema Definition
 
 ```python
 schema = GraphSchema(
@@ -138,47 +279,29 @@ schema = GraphSchema(
         NodeType(
             name="table",
             properties=[
-                PropertyDef("database", DataType.STRING),
-                PropertyDef("row_count", DataType.INT64, nullable=True),
-            ],
-            vectors=[
-                VectorDef("description_emb", DataType.VECTOR_FP32, dimension=768),
+                PropertyDef("database", "string"),
+                PropertyDef("row_count", "int64", nullable=True),
             ],
         ),
         NodeType(
             name="column",
             properties=[
-                PropertyDef("data_type", DataType.STRING),
-                PropertyDef("nullable", DataType.BOOL),
-            ],
-            vectors=[
-                VectorDef("description_emb", DataType.VECTOR_FP32, dimension=768),
+                PropertyDef("data_type", "string"),
+                PropertyDef("nullable", "bool"),
             ],
         ),
     ],
     edge_types=[
-        EdgeType(
-            name="has_column",
-            directed=True,
-            properties=[],
-        ),
+        EdgeType(name="has_column", directed=True),
         EdgeType(
             name="foreign_key",
             directed=True,
-            properties=[
-                PropertyDef("on_column", DataType.STRING),
-            ],
+            properties=[PropertyDef("on_column", "string")],
         ),
         EdgeType(
             name="learned",
             directed=False,
-            properties=[
-                PropertyDef("confidence", DataType.DOUBLE),
-                PropertyDef("source", DataType.STRING),
-            ],
-            vectors=[
-                VectorDef("relationship_emb", DataType.VECTOR_FP32, dimension=768),
-            ],
+            properties=[PropertyDef("confidence", "double")],
         ),
     ],
     edge_constraints=[
@@ -189,20 +312,19 @@ schema = GraphSchema(
 )
 ```
 
-### 5.2 Schema Design Decisions
+### 6.2 Schema Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
 | **Validation in C++** | Every `add_node`, `add_edge`, `update` validates against schema before touching storage. Invalid mutations rejected with clear errors. |
-| **Edge constraints are optional** | If defined, the engine enforces which node types an edge can connect. If omitted, that edge type is unconstrained. Some domains want strict typing, others want flexibility. |
-| **Schema evolution supported** | Adding new node types, edge types, or properties to existing types works without rebuild. Removing or changing types requires migration (same as zvec's `alter_column`). |
-| **Schema persisted as protobuf** | Stored alongside graph data in graph metadata, same pattern as zvec's collection schema. |
+| **Edge constraints are optional** | If defined, the engine enforces which node types an edge can connect. If omitted, that edge type is unconstrained. |
+| **Schema persisted as protobuf** | Stored in `graph_meta.pb` alongside graph data. |
 
 ---
 
-## 6. C++ Module Architecture
+## 7. C++ Module Architecture
 
-### 6.1 Directory Structure
+### 7.1 Directory Structure
 
 ```
 src/
@@ -211,37 +333,81 @@ src/
 │   ├── index/
 │   ├── sqlengine/
 │   └── ...
-├── graph/                           # NEW: graph module
-│   ├── graph_engine.h/cc            # top-level API, lifecycle management
+├── graph/                           # graph module
+│   ├── graph_collection.h/cc        # top-level API, lifecycle management
 │   ├── graph_schema.h/cc            # schema definition, validation, persistence
-│   ├── graph_store.h/cc             # orchestrates storage operations
-│   ├── traversal.h/cc               # multi-hop expand, subgraph extraction
-│   ├── mutation.h/cc                # atomic add/remove/update for nodes and edges
+│   ├── graph_node.h                 # GraphNode struct
+│   ├── graph_edge.h                 # GraphEdge struct
+│   ├── subgraph.h/cc                # Subgraph result with helpers
+│   ├── traversal.h/cc               # multi-hop BFS, subgraph extraction
+│   ├── mutation_engine.h/cc         # atomic add/remove/update for nodes and edges
 │   ├── storage/
 │   │   ├── storage_interface.h      # abstract storage interface
-│   │   └── zvec_storage.h/cc        # concrete impl using zvec collections
+│   │   ├── graph_kv_store.h/cc      # RocksDB KV-backed implementation
+│   │   └── index_merge_operator.h/cc# RocksDB merge operator for indexes
 │   └── proto/
-│       └── graph.proto              # schema, metadata, subgraph serialization
+│       └── graph.proto              # schema, metadata, data instance protos
 ├── binding/python/
 │   ├── python_collection.cc         # existing (unchanged)
-│   └── python_graph.cc              # NEW: pybind11 bindings for graph engine
+│   └── python_graph.cc              # pybind11 bindings for graph engine
 ```
 
-### 6.2 Class Hierarchy
+### 7.2 Class Hierarchy
 
 ```
-GraphEngine                          # top-level: create, open, destroy, repair
+GraphCollection                      # top-level: create, open, destroy, flush
   |-- GraphSchema                    # defines and validates node/edge types
-  |-- GraphStore                     # owns the two zvec collections
-  |     \-- StorageInterface         # abstract -- zvec today, cloud tomorrow
+  |-- GraphKVStore                   # RocksDB KV store (implements StorageInterface)
+  |     \-- IndexMergeOperator       # merge operator for secondary index CFs
   |-- MutationEngine                 # add/remove/update with atomic batches
   \-- TraversalEngine                # multi-hop expand, subgraph extraction
         \-- Subgraph                 # result object: nodes + edges + metadata
 ```
 
-### 6.3 Storage Interface
+### 7.3 GraphCollection (public API)
 
-The abstraction that enables future storage separation:
+```cpp
+class GraphCollection {
+ public:
+  static std::unique_ptr<GraphCollection> Create(
+      const std::string& path, const GraphSchema& schema);
+  static std::unique_ptr<GraphCollection> Open(const std::string& path);
+  void Destroy();
+  Status Flush();
+  const GraphSchema& GetSchema() const;
+
+  // Node operations
+  Status AddNode(const GraphNode& node);
+  Status RemoveNode(const std::string& node_id);
+  Status UpdateNode(const std::string& node_id,
+                    const std::unordered_map<std::string, std::string>& props);
+  std::vector<GraphNode> FetchNodes(const std::vector<std::string>& ids);
+  std::vector<GraphNode> FilterNodes(const std::string& filter_expr,
+                                     int limit = 1000);
+
+  // Edge operations
+  Status AddEdge(const std::string& source_id, const std::string& target_id,
+                 const std::string& edge_type,
+                 const std::unordered_map<std::string, std::string>& props);
+  Status RemoveEdge(const std::string& edge_id);
+  Status UpdateEdge(const std::string& edge_id,
+                    const std::unordered_map<std::string, std::string>& props);
+  std::vector<GraphEdge> FetchEdges(const std::vector<std::string>& ids);
+  std::vector<GraphEdge> FilterEdges(const std::string& filter_expr,
+                                     int limit = 1000);
+
+  // Traversal
+  Subgraph Traverse(const TraversalParams& params);
+
+  // Index operations
+  Status CreateIndex(const std::string& entity, const std::string& field);
+  Status DropIndex(const std::string& entity, const std::string& field);
+};
+```
+
+### 7.4 StorageInterface
+
+The abstract interface enables future storage backends:
 
 ```cpp
 class StorageInterface {
@@ -249,78 +415,228 @@ class StorageInterface {
   virtual ~StorageInterface() = default;
 
   // Node operations
-  virtual Status UpsertNodes(const std::vector<Document>& docs) = 0;
+  virtual Status UpsertNodes(const std::vector<GraphNode>& nodes) = 0;
   virtual Status DeleteNodes(const std::vector<std::string>& ids) = 0;
-  virtual std::vector<Document> FetchNodes(const std::vector<std::string>& ids) = 0;
-  virtual std::vector<Document> QueryNodes(const VectorQuery& query) = 0;
-  virtual std::vector<Document> FilterNodes(const std::string& filter) = 0;
+  virtual Result<std::vector<GraphNode>> FetchNodes(
+      const std::vector<std::string>& ids) = 0;
+  virtual Result<std::vector<GraphNode>> FetchNodesLite(
+      const std::vector<std::string>& ids) = 0;
+  virtual Result<std::vector<GraphNode>> FilterNodes(
+      const std::string& filter, int limit = 1000) = 0;
 
   // Edge operations
-  virtual Status UpsertEdges(const std::vector<Document>& docs) = 0;
+  virtual Status UpsertEdges(const std::vector<GraphEdge>& edges) = 0;
   virtual Status DeleteEdges(const std::vector<std::string>& ids) = 0;
-  virtual std::vector<Document> FetchEdges(const std::vector<std::string>& ids) = 0;
-  virtual std::vector<Document> FilterEdges(const std::string& filter) = 0;
+  virtual Result<std::vector<GraphEdge>> FetchEdges(
+      const std::vector<std::string>& ids) = 0;
+  virtual Result<std::vector<GraphEdge>> FilterEdges(
+      const std::string& filter, int limit = 1000) = 0;
 
   // Atomic batch (nodes + edges in one write)
   virtual Status AtomicBatch(const std::vector<Mutation>& mutations) = 0;
 
   // Index management
-  virtual Status CreateIndex(Target target, const std::string& field,
-                             const IndexParam& param) = 0;
-  virtual Status DropIndex(Target target, const std::string& field) = 0;
+  virtual Status CreateIndex(const std::string& entity,
+                             const std::string& field) = 0;
+  virtual Status DropIndex(const std::string& entity,
+                           const std::string& field) = 0;
 };
 ```
 
-`ZvecStorage` implements this using two `zvec::Collection` instances. A future `CloudStorage` would implement the same interface against a remote store — no changes to `GraphEngine`, `MutationEngine`, or `TraversalEngine`.
+`GraphKVStore` implements this using RocksDB column families, MultiGet, and WriteBatch.
 
-### 6.4 Concurrency Model
+### 7.5 Concurrency Model
 
 | Aspect | Design |
 |--------|--------|
-| Thread safety | `GraphEngine` is thread-safe — multiple agents call concurrently |
-| Reads | Lock-free — zvec collections handle concurrent reads internally |
+| Thread safety | `GraphCollection` is thread-safe — multiple agents call concurrently |
+| Reads | Lock-free — RocksDB MultiGet with internal MVCC snapshots |
 | Writes | Per-graph mutex for adjacency list consistency |
 | Python GIL | Released at pybind11 boundary — all C++ work runs without Python lock |
 | Scaling | N agents → N concurrent C++ threads, no Python serialization |
 
-### 6.5 Atomic Mutations via RocksDB WriteBatch
+---
 
-`ZvecStorage::AtomicBatch` collects all document mutations into a single RocksDB `WriteBatch` — all-or-nothing at the storage level.
+## 8. Read Flows
 
-**Example: adding an edge**
+### 8.1 Graph Traversal (agent hot path)
 
 ```
-add_edge("orders", "foreign_key", "customers")
+Agent: engine.Traverse({start_ids, max_depth=3, max_nodes=200})
 
-MutationEngine builds 3 operations:
-  1. Upsert edge doc  {id: "orders:foreign_key:customers", ...}
-  2. Append to orders.neighbor_ids + orders.neighbor_edge_ids
-  3. Append to customers.neighbor_ids + customers.neighbor_edge_ids
-
-StorageInterface::AtomicBatch([1, 2, 3])
-  -> ZvecStorage maps to single RocksDB WriteBatch
-  -> All-or-nothing commit
+TraversalEngine::Traverse()
+  |
+  |  1. Fetch seed nodes (lite — adjacency only)
+  |     kv_store_->FetchNodesLite(start_ids)
+  |       → RocksDB MultiGet on "nodes" CF
+  |       → deserialize GraphNodeProto (skip properties)
+  |       → return nodes with adjacency lists
+  |
+  |  2. BFS hop: collect neighbor edge IDs from adjacency
+  |     kv_store_->FetchEdges(candidate_edge_ids)
+  |       → RocksDB MultiGet on "edges" CF
+  |       → deserialize GraphEdgeProto
+  |       → apply edge filter
+  |
+  |  3. Fetch target nodes (lite)
+  |     kv_store_->FetchNodesLite(target_node_ids)
+  |       → RocksDB MultiGet on "nodes" CF
+  |       → apply node filter, budget check
+  |
+  |  4. Repeat hops 2-3 until max_depth
+  |
+  +→ Return Subgraph{nodes, edges}
 ```
 
-No partial writes. No repair needed for crash recovery during mutations.
+**Properties:**
+- Zero zvec Collection involvement — no Arrow, no IPC, no seg_mtx_
+- All reads via RocksDB MultiGet — lock-free, concurrent
+- Protobuf deserialization (~1us/node) replaces Arrow scalar reconstruction
+- Multiple agents traverse concurrently with no contention
+
+### 8.2 Direct Fetch (by ID)
+
+```
+Agent: engine.FetchNodes(["merchant_42", "acct_1"])
+
+  kv_store_->FetchNodes(ids)
+    → RocksDB MultiGet on "nodes" CF
+    → return full GraphNode with all properties
+```
+
+### 8.3 Filter Query
+
+```
+Agent: engine.FilterNodes("node_type = 'table' AND name = 'neodb.customers'")
+
+  kv_store_->FilterNodes(expr, limit)
+    |
+    |  1. Parse filter into (field, op, value) pairs
+    |
+    |  2. For each indexed field:
+    |     lookup CF "idx:nodes:{field}", key = value
+    |     → get candidate ID set
+    |
+    |  3. Intersect all candidate sets
+    |
+    |  4. Fetch matching nodes via MultiGet
+    |
+    +→ Return vector<GraphNode>
+```
+
+### 8.4 GraphRAG Query (vector search → graph traversal)
+
+```
+Agent workflow:
+  |
+  |  1. Vector search (zvec collection, managed separately)
+  |     vec_col = Collection.open("path/to/entity_embeddings")
+  |     results = vec_col.query(vector=query_vec, topk=10)
+  |       → HNSW search → returns node IDs with similarity scores
+  |
+  |  2. Fetch seed nodes from graph collection
+  |     graph.FetchNodes(seed_ids)
+  |       → RocksDB MultiGet → full nodes with properties
+  |
+  |  3. Traverse from seeds
+  |     graph.Traverse({seed_ids, max_depth=2})
+  |       → BFS via RocksDB MultiGet
+  |
+  |  4. Assemble subgraph context for LLM
+  |
+  +→ LLM call with graph context
+```
+
+The vector collection is a standard zvec Collection, created and managed by the embedding algorithm. The graph collection has no knowledge of it.
 
 ---
 
-## 7. Traversal Engine
+## 9. Write Flows
 
-### 7.1 Core Operation: Subgraph Extraction
-
-The primary traversal operation is "given seed nodes, expand N hops with filters, return the subgraph." This is the operation agents use most — find seeds via vector search, expand to gather context.
+### 9.1 AddNode
 
 ```
-traverse(start_ids, depth, edge_filter, node_filter)
-  -> returns Subgraph { nodes, edges, metadata }
+MutationEngine::AddNode(node)
+  |
+  |  1. Validate against schema
+  |
+  |  2. Set system fields (version=1, updated_at=now)
+  |
+  |  3. Atomic write to KV store (single WriteBatch)
+  |     rocksdb::WriteBatch batch;
+  |     batch.Put(nodes_cf, node.id, GraphNodeProto.Serialize())
+  |     batch.Merge(idx_node_type_cf, node.node_type, add(node.id))
+  |     // for each indexed property:
+  |     batch.Merge(idx_{prop}_cf, prop_value, add(node.id))
+  |     db_->Write(write_opts, &batch)
+  |
+  +→ Return OK
 ```
 
-### 7.2 Traversal Algorithm
+### 9.2 AddEdge
 
 ```
-Input:  seed node IDs, max_depth, edge_filter, node_filter
+MutationEngine::AddEdge(source_id, target_id, edge_type, properties)
+  |
+  |  1. Fetch source + target from KV store
+  |
+  |  2. Validate edge against schema
+  |
+  |  3. Build edge, update adjacency lists on both nodes
+  |
+  |  4. Single atomic WriteBatch:
+  |     batch.Put(edges_cf, edge.id, GraphEdgeProto.Serialize())
+  |     batch.Put(nodes_cf, source.id, updated_source_proto)
+  |     batch.Put(nodes_cf, target.id, updated_target_proto)
+  |     batch.Merge(idx_source_id_cf, source_id, add(edge.id))
+  |     batch.Merge(idx_target_id_cf, target_id, add(edge.id))
+  |     batch.Merge(idx_edge_type_cf, edge_type, add(edge.id))
+  |     db_->Write(write_opts, &batch)
+  |     → truly atomic: edge + both adjacency updates + all indexes
+  |
+  +→ Return OK
+```
+
+### 9.3 RemoveNode (cascade delete)
+
+```
+MutationEngine::RemoveNode(node_id)
+  |
+  |  1. Fetch node from KV store
+  |  2. Fetch all connected edges (batch MultiGet)
+  |  3. Compute all adjacency updates on neighbor nodes
+  |
+  |  4. Single atomic WriteBatch:
+  |     batch.Delete(nodes_cf, node_id)
+  |     batch.Merge(idx_node_type_cf, node.node_type, remove(node_id))
+  |     for each connected edge:
+  |       batch.Delete(edges_cf, edge.id)
+  |       batch.Merge(idx_*_cf, ..., remove(edge.id))
+  |     for each neighbor node:
+  |       batch.Put(nodes_cf, neighbor.id, updated_neighbor_proto)
+  |     db_->Write(write_opts, &batch)
+  |     → truly atomic cascade delete
+  |
+  +→ Return OK
+```
+
+---
+
+## 10. Traversal Engine
+
+### 10.1 Core Operation: Subgraph Extraction
+
+The primary traversal operation is "given seed nodes, expand N hops with filters, return the subgraph."
+
+```
+traverse(start_ids, depth, edge_filter, node_filter, max_nodes)
+  -> returns Subgraph { nodes, edges, truncated }
+```
+
+### 10.2 Traversal Algorithm
+
+```
+Input:  seed node IDs, max_depth, edge_filter, node_filter, max_nodes
 Output: Subgraph (all discovered nodes + edges)
 
 visited_nodes = set(seed_ids)
@@ -328,95 +644,120 @@ visited_edges = set()
 frontier = seed_ids
 
 for hop in 1..max_depth:
-    # Use adjacency lists on frontier nodes to get candidate neighbors + edge IDs
-    candidates = []
+    # Use adjacency lists on frontier nodes to get candidate edge IDs
+    candidate_edge_ids = []
     for node in frontier:
         for (neighbor_id, edge_id) in zip(node.neighbor_ids, node.neighbor_edge_ids):
-            if neighbor_id not in visited_nodes:
-                candidates.append((neighbor_id, edge_id))
+            if neighbor_id not in visited_nodes and edge_id not in visited_edges:
+                candidate_edge_ids.append(edge_id)
 
-    # Batch fetch candidate edge docs, apply edge_filter
-    edge_docs = storage.FetchEdges([c.edge_id for c in candidates])
-    filtered_edges = apply_filter(edge_docs, edge_filter)
+    # Batch fetch edges, apply edge_filter
+    edges = storage.FetchEdges(candidate_edge_ids)
+    filtered_edges = apply_filter(edges, edge_filter)
 
-    # Batch fetch target nodes, apply node_filter
-    target_ids = [e.target_id for e in filtered_edges]
+    # Batch fetch target nodes, apply node_filter + budget
+    target_ids = unique_targets(filtered_edges) - visited_nodes
     target_nodes = storage.FetchNodes(target_ids)
     filtered_nodes = apply_filter(target_nodes, node_filter)
 
-    # Update state
+    # Budget check
+    if max_nodes > 0 and visited_nodes.size() + filtered_nodes.size() > max_nodes:
+        truncate and set truncated = true
+        break
+
     visited_nodes.update(filtered_nodes.ids)
     visited_edges.update(filtered_edges.ids)
-    frontier = filtered_nodes.ids
+    frontier = filtered_nodes
 
-return Subgraph(
-    nodes = storage.FetchNodes(visited_nodes),
-    edges = storage.FetchEdges(visited_edges),
-)
+return Subgraph(nodes, edges, truncated)
 ```
 
-**Batch-oriented:** Each hop is 2 collection calls (batch fetch edges, batch fetch nodes) regardless of fan-out. For 3 hops: ~6 collection calls total. All in C++, no Python round-trips.
+**Batch-oriented:** Each hop is 2 storage calls (batch fetch edges, batch fetch nodes) regardless of fan-out. For 3 hops: ~6 calls total. All in C++, no Python round-trips.
 
-### 7.3 Subgraph Result Object
+### 10.3 Subgraph Result Object
 
 ```cpp
 struct Subgraph {
-  std::vector<Node> nodes;
-  std::vector<Edge> edges;
+  std::vector<GraphNode> nodes;
+  std::vector<GraphEdge> edges;
+  bool truncated = false;
 
   // Convenience accessors
-  std::vector<Node> nodes_of_type(const std::string& type) const;
-  std::vector<Edge> edges_of_type(const std::string& type) const;
-  std::vector<Edge> edges_from(const std::string& node_id) const;
-  std::vector<Edge> edges_to(const std::string& node_id) const;
-  std::vector<Node> neighbors(const std::string& node_id) const;
+  std::vector<const GraphNode*> NodesOfType(const std::string& type) const;
+  std::vector<const GraphEdge*> EdgesOfType(const std::string& type) const;
+  std::vector<const GraphEdge*> EdgesFrom(const std::string& node_id) const;
+  std::vector<const GraphEdge*> EdgesTo(const std::string& node_id) const;
+  std::vector<const GraphNode*> Neighbors(const std::string& node_id) const;
 
   // Serialization for agent consumption
-  std::string to_json() const;
-  std::string to_text() const;    // human/LLM-readable summary
+  std::string ToJson() const;
+  std::string ToText() const;
 };
 ```
 
-The `Subgraph` is the primary response type for agents. It carries all the context needed — nodes with their properties, edges with their properties, and convenience methods to navigate the result.
+---
+
+## 11. Concurrent Read Scaling
+
+### 11.1 Why RocksDB scales and zvec Collections don't
+
+```
+zvec Collection::Fetch (previous approach):
+  ┌─────────────────────────────┐
+  │  shared_lock(schema_mtx)    │  ← shared, OK
+  │  for each pk:               │
+  │    id_map_->has(pk)         │  ← RocksDB Get (lock-free) OK
+  │    segment->Fetch(id)       │  ← exclusive seg_mtx_ ← BOTTLENECK
+  │      seg_mtx_ is std::mutex │     serializes ALL concurrent reads
+  │      └─ Arrow IPC read      │     within the same segment
+  └─────────────────────────────┘
+
+GraphKVStore::FetchNodes (current):
+  ┌─────────────────────────────┐
+  │  db_->MultiGet(             │  ← single RocksDB call
+  │    read_opts,               │     lock-free (internal MVCC snapshots)
+  │    nodes_cf,                │     parallelizes I/O across keys
+  │    N keys,                  │     block cache is thread-safe
+  │    values, statuses)        │
+  │                             │
+  │  for each value:            │
+  │    proto.ParseFromString()  │  ← CPU-only, no locks, no I/O
+  └─────────────────────────────┘
+```
+
+**Expected scaling**: near-linear up to 16-32 threads for in-memory workloads (block cache hits), gradual saturation beyond from CPU/memory bandwidth.
 
 ---
 
-## 8. Python API
+## 12. Python API
 
 Thin layer — type conversions, ergonomic wrappers, agent-friendly formatting. No graph logic.
 
-### 8.1 Graph Lifecycle
+### 12.1 Graph Lifecycle
 
 ```python
-import zvec
+from zvec.graph import Graph, GraphSchema, NodeType, EdgeType, EdgeConstraint, PropertyDef
 
-# Define schema
-schema = zvec.GraphSchema(
-    name="data_catalog",
-    node_types=[...],
-    edge_types=[...],
-    edge_constraints=[...],
-)
+schema = GraphSchema(name="my_graph", node_types=[...], edge_types=[...])
 
-# Create and open
-graph = zvec.create_graph(path="./my_graph", schema=schema)
+# Create a new graph
+graph = Graph.create(path="/data/my_graph", schema=schema)
 
 # Open existing
-graph = zvec.open_graph(path="./my_graph")
+graph = Graph.open(path="/data/my_graph")
 
-# Destroy
+# Flush / destroy
+graph.flush()
 graph.destroy()
 ```
 
-### 8.2 Mutations
+### 12.2 Mutations
 
 ```python
 # Add nodes
 graph.add_node(id="orders", node_type="table", properties={
     "database": "analytics",
-    "row_count": 1_000_000,
-}, vectors={
-    "description_emb": [0.1, 0.2, ...],
+    "row_count": "1000000",
 })
 
 # Add edges
@@ -428,475 +769,158 @@ graph.add_edge(
 )
 
 # Update properties
-graph.update_node("orders", properties={"row_count": 1_500_000})
-graph.update_edge("orders:foreign_key:customers", properties={"on_column": "cust_id"})
+graph.update_node("orders", properties={"row_count": "1500000"})
 
 # Delete
-graph.delete_node("orders")        # also removes all connected edges
-graph.delete_edge("orders:foreign_key:customers")
+graph.remove_node("orders")       # cascade-deletes all connected edges
+graph.remove_edge("orders--foreign_key--customers")
 ```
 
-### 8.3 Query and Traversal
+### 12.3 Query and Traversal
 
 ```python
-# Vector search on nodes
-seeds = graph.search_nodes(
-    vector=query_embedding,
-    vector_field="description_emb",
-    topk=5,
-    filter="node_type = 'table'",
-)
+# Fetch by ID
+node = graph.fetch_node("orders")
+edge = graph.fetch_edge("orders--has_column--orders.customer_id")
 
-# Vector search on edges
-edges = graph.search_edges(
-    vector=relationship_embedding,
-    vector_field="relationship_emb",
-    topk=10,
-    filter="edge_type = 'learned' AND confidence > 0.8",
-)
+# Filter
+tables = graph.filter_nodes("node_type = 'table'")
+fk_edges = graph.filter_edges("edge_type = 'foreign_key'")
 
-# Subgraph extraction
+# Subgraph traversal
 subgraph = graph.traverse(
-    start=[node.id for node in seeds],
-    depth=3,
-    edge_filter="edge_type IN ('has_column', 'foreign_key')",
-    node_filter="node_type IN ('table', 'column')",
+    start=["orders", "customers"],
+    depth=2,
+    max_nodes=100,
+    edge_filter="edge_type = 'has_column'",
 )
 
 # Access results
-subgraph.nodes          # list[Node]
-subgraph.edges          # list[Edge]
+subgraph.nodes          # list[GraphNode]
+subgraph.edges          # list[GraphEdge]
 subgraph.to_json()      # JSON serialization
-subgraph.to_text()      # LLM-friendly text representation
-
-# Convenience
-tables = subgraph.nodes_of_type("table")
-columns = subgraph.nodes_of_type("column")
-fks = subgraph.edges_of_type("foreign_key")
+subgraph.to_text()      # LLM-friendly text
 ```
 
-### 8.4 Index Management
+### 12.4 Index Management
 
 ```python
-# Create indexes on property fields (on demand)
-graph.create_index("nodes", "department", zvec.InvertIndexParam())
-graph.create_index("edges", "confidence", zvec.InvertIndexParam(
-    enable_range_optimization=True
-))
-
-# Create vector indexes (on demand)
-graph.create_index("nodes", "description_emb", zvec.HnswIndexParam(
-    ef_construction=200, m=16
-))
-
-# Drop indexes
-graph.drop_index("nodes", "department")
-```
-
-### 8.5 Repair
-
-```python
-# Reconcile adjacency lists with edges collection
-# Run after suspected inconsistency or on startup if desired
-graph.repair()
+graph.create_index("nodes", "database")
+graph.create_index("edges", "on_column")
+graph.drop_index("nodes", "database")
 ```
 
 ---
 
-## 9. Agent Optimization
+## 13. Agent Optimization
 
-### 9.1 Response Design
+### 13.1 Response Design
 
 All responses are structured for direct consumption by LLM agents:
 
 | Method | Returns | Agent Use |
 |--------|---------|-----------|
-| `search_nodes()` | `list[Node]` | Seed entity discovery |
-| `search_edges()` | `list[Edge]` | Relationship discovery |
 | `traverse()` | `Subgraph` | Context gathering for generation |
-| `fetch_node()` | `Node` | Point lookup |
-| `fetch_edge()` | `Edge` | Point lookup |
+| `filter_nodes()` | `list[GraphNode]` | Find nodes by type/property |
+| `filter_edges()` | `list[GraphEdge]` | Find edges by type/property |
+| `fetch_node()` | `GraphNode` | Point lookup |
+| `fetch_edge()` | `GraphEdge` | Point lookup |
 
-`Subgraph.to_json()` returns a structured JSON that agents can parse. `Subgraph.to_text()` returns a human/LLM-readable summary suitable for prompt injection.
-
-### 9.2 Text Representation Example
+### 13.2 Text Representation Example
 
 ```
 Subgraph: 4 nodes, 5 edges
 
 Nodes:
-  [table] orders (database=analytics, row_count=1000000)
-  [table] customers (database=analytics, row_count=50000)
-  [column] orders.customer_id (data_type=INT64, nullable=false)
-  [column] orders.amount (data_type=DOUBLE, nullable=false)
+  [table] orders {database: analytics, row_count: 1000000}
+  [table] customers {database: analytics, row_count: 50000}
+  [column] orders.customer_id {data_type: INT64}
+  [column] orders.amount {data_type: DOUBLE}
 
 Edges:
   orders --has_column--> orders.customer_id
   orders --has_column--> orders.amount
-  orders --foreign_key--> customers (on_column=customer_id)
-  customers --learned--> orders (confidence=0.92, source=agent_v2)
+  orders --foreign_key--> customers {on_column: customer_id}
+  customers --learned-- orders {confidence: 0.92}
 ```
 
-### 9.3 Performance Targets
+### 13.3 Performance Targets
 
 | Operation | Target Latency | Notes |
 |-----------|---------------|-------|
-| Vector search (nodes or edges) | < 10ms | Same as zvec baseline |
 | Single-hop traversal | < 5ms | Batch fetch from adjacency |
 | 3-hop subgraph extraction | < 20ms | 6 batch operations |
-| Node/edge point lookup | < 1ms | Direct ID fetch |
-| Add node | < 2ms | Single doc upsert |
-| Add edge | < 5ms | Atomic batch (3 writes) |
-
-These are in-process latencies. For context: an LLM API call is 200-2000ms. The graph operations should be negligible in an agent loop.
-
-### 9.4 Concurrency
-
-Designed for N concurrent agents:
-- All read operations are lock-free
-- Write operations use per-graph mutex (not per-node — keeps it simple)
-- GIL released at pybind11 boundary
-- No Python-side bottleneck
+| Node/edge point lookup | < 1ms | Direct RocksDB MultiGet |
+| Add node | < 2ms | Single WriteBatch |
+| Add edge | < 5ms | Atomic WriteBatch (3 writes) |
+| Filter query (indexed) | < 5ms | Index lookup + MultiGet |
 
 ---
 
-## 10. End-to-End Example: Data Catalog GraphRAG
+## 14. Scale Considerations (100K Agent Velocity)
 
-```python
-import zvec
+### 14.1 Traversal Control
 
-# 1. Initialize
-zvec.init(query_threads=8)
+**Node budget.** Depth alone is not sufficient — `depth=3` on a highly connected graph can explode to 10K+ nodes. The `traverse()` API accepts a `max_nodes` parameter. When the budget is exhausted mid-traversal, the engine stops expanding and returns what it has, with a `truncated: true` flag on the `Subgraph`.
 
-# 2. Define schema
-schema = zvec.GraphSchema(
-    name="data_catalog",
-    node_types=[
-        zvec.NodeType("catalog", properties=[
-            zvec.PropertyDef("owner", zvec.DataType.STRING),
-        ]),
-        zvec.NodeType("schema", properties=[
-            zvec.PropertyDef("database", zvec.DataType.STRING),
-        ]),
-        zvec.NodeType("table", properties=[
-            zvec.PropertyDef("database", zvec.DataType.STRING),
-            zvec.PropertyDef("row_count", zvec.DataType.INT64, nullable=True),
-        ], vectors=[
-            zvec.VectorDef("desc_emb", zvec.DataType.VECTOR_FP32, 768),
-        ]),
-        zvec.NodeType("column", properties=[
-            zvec.PropertyDef("data_type", zvec.DataType.STRING),
-            zvec.PropertyDef("nullable", zvec.DataType.BOOL),
-        ], vectors=[
-            zvec.VectorDef("desc_emb", zvec.DataType.VECTOR_FP32, 768),
-        ]),
-    ],
-    edge_types=[
-        zvec.EdgeType("contains", directed=True),
-        zvec.EdgeType("has_column", directed=True),
-        zvec.EdgeType("foreign_key", directed=True, properties=[
-            zvec.PropertyDef("on_column", zvec.DataType.STRING),
-        ]),
-        zvec.EdgeType("learned", directed=False, properties=[
-            zvec.PropertyDef("confidence", zvec.DataType.DOUBLE),
-            zvec.PropertyDef("source", zvec.DataType.STRING),
-        ]),
-    ],
-    edge_constraints=[
-        zvec.EdgeConstraint("contains", source="catalog", target="schema"),
-        zvec.EdgeConstraint("contains", source="schema", target="table"),
-        zvec.EdgeConstraint("has_column", source="table", target="column"),
-        zvec.EdgeConstraint("foreign_key", source="table", target="table"),
-    ],
-)
+**Cycle detection.** The traversal engine tracks `visited_nodes` which naturally prevents cycles. No node is visited twice.
 
-# 3. Create graph
-graph = zvec.create_graph(path="./catalog_graph", schema=schema)
+**Beam pruning.** At each hop, rather than expanding all neighbors, score candidates and keep only the top-N per hop. Configurable via a `beam_width` parameter.
 
-# 4. Create vector indexes
-graph.create_index("nodes", "desc_emb", zvec.HnswIndexParam(ef_construction=200))
+### 14.2 Write Contention
 
-# 5. Populate (bulk load)
-graph.add_node("orders", "table", {"database": "analytics", "row_count": 1_000_000},
-               vectors={"desc_emb": embed("Orders table with customer purchases")})
-graph.add_node("customers", "table", {"database": "analytics", "row_count": 50_000},
-               vectors={"desc_emb": embed("Customer master data")})
-graph.add_node("orders.customer_id", "column", {"data_type": "INT64", "nullable": False},
-               vectors={"desc_emb": embed("Foreign key to customers table")})
-graph.add_node("orders.amount", "column", {"data_type": "DOUBLE", "nullable": False},
-               vectors={"desc_emb": embed("Order amount in dollars")})
+The per-graph mutex serializes all writes. This is sufficient for typical GraphRAG workloads (bulk load at build time, read-heavy traversals). For higher write throughput:
 
-graph.add_edge("orders", "customers", "foreign_key", {"on_column": "customer_id"})
-graph.add_edge("orders", "orders.customer_id", "has_column")
-graph.add_edge("orders", "orders.amount", "has_column")
+1. **Per-node locking** — Replace single mutex with lock table keyed by node ID
+2. **Write batching with WAL** — Queue mutations, flush periodically
+3. **Lock-free adjacency with CAS** — Compare-and-swap on adjacency updates
 
-# 6. Agent query flow
-query = "How is customer churn affecting quarterly revenue?"
-query_vec = embed(query)
+### 14.3 Observability
 
-# Step 1: Vector search for candidate tables
-seeds = graph.search_nodes(
-    vector=query_vec,
-    vector_field="desc_emb",
-    topk=5,
-    filter="node_type = 'table'",
-)
+**Node/edge versioning.** Every node and edge carries `version` and `updated_at` fields, automatically managed by the MutationEngine.
 
-# Step 2: Expand to get full context
-subgraph = graph.traverse(
-    start=[n.id for n in seeds],
-    depth=3,
-    edge_filter="edge_type IN ('has_column', 'foreign_key', 'learned')",
-)
-
-# Step 3: Feed to LLM
-context = subgraph.to_text()
-sql = llm.generate(f"Given this schema context:\n{context}\n\nWrite SQL for: {query}")
-```
+**Traversal telemetry.** Each `traverse()` call can produce a lightweight trace of hops, candidates, and filter results.
 
 ---
 
-## 11. Scale Considerations (100K Agent Velocity)
+## 15. Traversal Algorithm Analysis
 
-The sections above describe the core engine. The following concerns apply when this engine is serving tens or hundreds of thousands of concurrent agents in an enterprise setting. These are captured here as design constraints — some are addressed in the current architecture, others are deferred to future iterations.
+### 15.1 Current Implementation
 
-### 11.1 Graph Integrity
-
-**Tombstone deletes, not hard deletes.** When a node or edge is deleted, it is marked with a tombstone (`_deleted: true`, `_deleted_at: timestamp`) rather than physically removed. Agents mid-traversal will encounter the tombstone and skip it gracefully rather than hitting a missing document or a dangling adjacency pointer.
-
-- Tombstoned nodes: traversal skips them, `search_nodes` excludes them via filter
-- Tombstoned edges: traversal skips them, adjacency lists retain the ID (cleaned up lazily)
-- A background compaction process hard-deletes tombstoned entities after a configurable TTL (e.g., 24h)
-
-**Continuous reconciliation.** The on-demand `repair()` is insufficient at scale. A background reconciliation thread should:
-- Periodically scan adjacency lists and verify referenced edge IDs exist in the edges collection
-- Detect orphan edges (edges whose source/target nodes are tombstoned or missing)
-- Emit metrics on inconsistency count and reconciliation lag
-- Run at low priority — should not compete with agent read/write paths
-
-This is the biggest failure mode at scale: adjacency lists drifting from edge documents. The atomic `WriteBatch` prevents it during normal operation, but crash recovery, partial restores, and storage-level issues can cause drift over time.
-
-### 11.2 Traversal Control
-
-**Node budget.** Depth alone is not sufficient — `depth=3` on a highly connected FK graph can explode to 10K+ nodes. The `traverse()` API must accept a `max_nodes` parameter:
-
-```python
-subgraph = graph.traverse(
-    start=seed_ids,
-    depth=3,
-    max_nodes=500,           # hard cap on total nodes in result
-    edge_filter="...",
-    node_filter="...",
-)
-```
-
-When the budget is exhausted mid-traversal, the engine stops expanding and returns what it has, with a `truncated: true` flag on the `Subgraph`.
-
-**Cycle detection.** Non-negotiable. The traversal engine already tracks `visited_nodes` (Section 7.2), which naturally prevents cycles. This must be preserved in all traversal variants — no node is visited twice.
-
-**Beam pruning.** At each hop, rather than expanding all neighbors, score candidates and keep only the top-N per hop. Scoring can be:
-- Edge property-based (e.g., highest confidence learned edges first)
-- Vector similarity-based (re-score neighbors against the original query vector)
-- Configurable via a `beam_width` parameter
-
-```python
-subgraph = graph.traverse(
-    start=seed_ids,
-    depth=3,
-    max_nodes=500,
-    beam_width=20,           # keep top 20 candidates per hop
-    edge_filter="...",
-)
-```
-
-### 11.3 Staleness and Versioning
-
-Catalogs change — tables get dropped, FKs added, columns renamed. Agents need to reason about the freshness of the context they receive.
-
-**Node/edge versioning.** Every node and edge carries:
-- `_version: uint64` — monotonically increasing, bumped on every mutation
-- `_updated_at: uint64` — timestamp of last mutation
-
-These are system-managed fields (not schema-defined), automatically set by the `MutationEngine`.
-
-**Subgraph staleness metadata.** The `Subgraph` result includes:
-- `oldest_node_updated_at` — the least-recently-updated node in the subgraph
-- `newest_node_updated_at` — the most-recently-updated node
-- Per-node `_updated_at` accessible on each node object
-
-This lets agents decide: "this subgraph was last touched 6 months ago — I should flag low confidence" or "this was updated 2 minutes ago — high confidence."
-
-### 11.4 Write Contention
-
-The per-graph mutex (Section 9.4) becomes a bottleneck when many agents are concurrently writing `learned` edges. Structural edges (FK, has_column) are written by admin/ETL processes — low contention. Learned edges are written by agents — high contention.
-
-**Tiered write paths:**
-
-| Edge Category | Write Path | Consistency |
-|---------------|-----------|-------------|
-| Structural edges (FK, has_column, contains) | Synchronous, per-graph mutex, atomic `WriteBatch` | Strong — immediately visible |
-| Learned edges | Async write queue, batched flush | Eventually consistent — visible after flush interval |
-
-Learned edge writes:
-- Agent calls `add_edge(type="learned")` — returns immediately, edge is queued
-- Background writer batches queued edges and flushes at configurable interval (e.g., 100ms or 100 edges, whichever comes first)
-- Agents reading learned edges may see slight lag — acceptable since learned edges are probabilistic by nature
-- The queue is per-graph, in-memory, bounded (backpressure if queue is full)
-
-This separates the hot write path (learned edges from many agents) from the structural write path (admin mutations that need strong consistency).
-
-### 11.5 Observability
-
-**Node hotness tracking.** Track access counts per node (read and write) in a fixed-size in-memory counter (e.g., Count-Min Sketch). Exposes:
-- Top-N hottest nodes (cache candidates — relates to Open Question 3)
-- Hot node alerts (a single table being hit by 10K agents simultaneously may indicate a problem)
-
-**Traversal telemetry.** Each `traverse()` call produces a lightweight trace:
-
-```json
-{
-  "trace_id": "abc-123",
-  "start_nodes": ["orders", "customers"],
-  "depth_reached": 3,
-  "nodes_visited": 47,
-  "nodes_returned": 47,
-  "edges_traversed": 82,
-  "truncated": false,
-  "latency_ms": 12,
-  "hops": [
-    {"depth": 1, "candidates": 15, "after_filter": 12, "after_beam": 12},
-    {"depth": 2, "candidates": 38, "after_filter": 30, "after_beam": 20},
-    {"depth": 3, "candidates": 22, "after_filter": 15, "after_beam": 15}
-  ]
-}
-```
-
-This is critical for debugging "why did the agent choose the wrong tables?" — you can trace the traversal path and see where the wrong branch was taken or the right branch was pruned.
-
-**Metrics exposed:**
-- Traversal latency histogram (p50, p95, p99)
-- Nodes/edges per traversal histogram
-- Mutation throughput (structural vs learned)
-- Reconciliation lag and inconsistency count
-- Write queue depth (for async learned edges)
-
----
-
-## 12. Traversal Algorithm Analysis
-
-### 12.1 Current Implementation
-
-The v0.1 traversal engine uses **basic BFS with per-node storage lookups**:
+The v0.1 traversal engine uses **BFS with batched storage lookups**:
 
 ```
 For each hop (1..max_depth):
-  For each node in frontier:
-    Read adjacency list from storage (RocksDB point lookup)
-    Batch-fetch edge documents, apply in-memory filter
-    Batch-fetch neighbor nodes, apply in-memory filter
-    Check max_nodes budget, update visited set
+  Collect edge IDs from frontier adjacency lists
+  Batch-fetch edge documents, apply in-memory filter
+  Batch-fetch neighbor nodes, apply in-memory filter
+  Check max_nodes budget, update visited set
 ```
 
-- **Complexity:** O(V + E) per traversal, with per-node I/O
+- **Complexity:** O(V + E) per traversal
 - **Parallelism:** None — single-threaded BFS
-- **Filter execution:** Naive string parsing per node (`"field = 'value'"`)
+- **Filter execution:** Simple string parsing (`"field = 'value'"`)
 - **Cycle detection:** Hash set of visited node IDs
 
-This is correct and sufficient for the GraphRAG use case: shallow traversals (2-5 hops) over small neighborhoods (< 1000 nodes). A typical query (3 seeds, 2-hop, max_nodes=100) touches ~200 nodes with ~200 RocksDB reads, completing in **< 10ms**. The LLM inference that follows takes 500ms-5s, so traversal is not the bottleneck.
+This is correct and sufficient for GraphRAG: shallow traversals (2-5 hops) over small neighborhoods (< 1000 nodes). A typical query completes in < 10ms. The LLM inference that follows takes 500ms-5s.
 
-### 12.2 State-of-the-Art Comparison
+### 15.2 Incremental Optimization Path
 
-| Approach | Key Insight | Performance |
-|----------|------------|-------------|
-| **SuiteSparse:GraphBLAS + LAGraph** | Graph ops = sparse linear algebra. BFS = sparse matrix-vector multiply (SpMV). Visited set = complement mask. | Billions of edges in seconds, single machine |
-| **Ligra / Julienne** | Direction-optimized BFS: push (sparse frontier) vs pull (dense frontier) switching based on frontier/graph ratio | Near-optimal work for any frontier size |
-| **Gunrock** | GPU-accelerated graph analytics via massive parallelism | Billions of edges/second on GPU |
-| **KuzuDB** | Worst-case optimal joins for multi-hop pattern matching, compiled to vectorized relational operators | Embedded, competitive with Neo4j |
-| **Neo4j / Memgraph** | Morsel-driven parallelism, columnar adjacency, JIT-compiled queries | Production-grade, millions of edges |
-
-The GraphBLAS insight is particularly elegant: a k-hop BFS is just `frontier = A * frontier` repeated k times, where A is the adjacency matrix in CSR format and the multiply uses a semiring (AND/OR for reachability, min/+ for shortest path, etc.). The visited set becomes a complement mask on SpMV — zero-copy, cache-friendly, SIMD-vectorized.
-
-### 12.3 Gap Analysis
-
-| Aspect | v0.1 BFS | SOTA |
-|--------|----------|------|
-| Traversal depth | 2-5 hops | Arbitrary |
-| Graph size | < 100K nodes | Billions of edges |
-| Parallelism | None | Thread/GPU parallel |
-| Memory layout | RocksDB point lookups | CSR/columnar, cache-aware |
-| Filter execution | String parsing per node | Compiled/vectorized predicates |
-| Direction optimization | No | Push/pull switching |
-
-### 12.4 When SOTA Becomes Necessary
-
-The v0.1 approach breaks down in these scenarios:
-
-1. **Deep traversals (10+ hops)** — per-node I/O model degrades; need bulk adjacency loading or GraphBLAS-style SpMV
-2. **Large dense neighborhoods (10K+ edges per node)** — exhaustive expansion is wasteful; need beam pruning or probabilistic sampling
-3. **Complex filter predicates** — string parsing per node is O(n) in predicate length; need compiled filter expressions
-4. **Analytical workloads** — PageRank, community detection, etc. require full-graph iteration, not local BFS
-
-### 12.5 Incremental Optimization Path
-
-These can be adopted independently as scale demands:
-
-1. **Batch adjacency loading** — `RocksDB::MultiGet` for the entire frontier instead of per-node `Get`. Expected: 3-5x throughput improvement on large frontiers.
-2. **Compiled filters** — pre-parse filter expressions into a predicate tree at query construction time, evaluate without string allocation per node.
-3. **Parallel frontier expansion** — partition frontier across threads, each expands independently, merge results. Lock-free with per-thread visited sets merged via atomic union.
-4. **GraphBLAS backend** — for analytical workloads, maintain a CSR adjacency matrix alongside the property store. Use GraphBLAS SpMV for structural traversal, point lookups for property hydration. The two representations stay in sync via the mutation engine.
-5. **Direction-optimized BFS** — when frontier exceeds ~10% of graph size, switch from push (iterate frontier, check neighbors) to pull (iterate all vertices, check if any frontier neighbor exists). Requires maintaining both CSR and CSC formats.
+1. **Pre-allocated vectors** — `reserve()` before push_back loops
+2. **Node cache in Traverse()** — method-local cache eliminates redundant RocksDB fetches
+3. **Skip vector deserialization** — `FetchNodesLite()` skips properties during traversal
+4. **Batch edge fetches** — single MultiGet instead of per-edge fetches in mutation paths
+5. **Compiled filters** — pre-parse filter expressions into predicate tree
+6. **Parallel frontier expansion** — partition frontier across threads
+7. **GraphBLAS backend** — for analytical workloads requiring full-graph iteration
 
 ---
 
-## 13. Concurrency Model
+## 16. Open Questions
 
-### 13.1 Current Implementation
-
-The v0.1 concurrency model is simple:
-
-- **MutationEngine:** A single `std::mutex` serializes all write operations. This exists because edge mutation is a 3-write operation (edge doc + source adjacency + target adjacency). Without the lock, concurrent mutations to the same node trigger a read-modify-write race: both threads read the adjacency list, append their entry, and write back — losing one update.
-
-- **TraversalEngine:** No locking. Reads are naturally concurrent. Multiple agents can traverse simultaneously without contention.
-
-- **RocksDB layer:** Provides snapshot isolation for reads, so a traversal always sees a consistent state even if a mutation is in flight.
-
-### 13.2 Scaling Limitations
-
-At 100K concurrent agents:
-
-- **Write throughput:** All mutations funnel through one mutex. If agents are frequently adding learned edges or updating confidence scores, they queue up. With ~50μs per write and the lock held for ~150μs per edge mutation (3 writes), theoretical max is ~6,600 edge mutations/second.
-
-- **Write-read latency:** Traversals aren't blocked by the mutex, but they might read slightly stale adjacency lists (snapshot isolation means they see the state at read-start, not real-time). This is acceptable for GraphRAG — the next traversal will see the updated state.
-
-### 13.3 Future Concurrency Approaches
-
-In order of implementation complexity:
-
-1. **Per-node locking** — Replace the single mutex with a lock table keyed by node ID. Mutations only lock the nodes they touch. Two mutations to different parts of the graph proceed in parallel. Estimated effort: moderate. Expected improvement: proportional to graph size / working set.
-
-2. **Write batching with WAL** — Queue mutations in a write-ahead log and flush periodically (e.g., every 10ms or every 100 mutations). Amortizes the lock acquisition cost. Good for bursty writes from many agents. Estimated effort: moderate.
-
-3. **Lock-free adjacency with CAS** — Use compare-and-swap on adjacency list updates. Read current list, compute new list, CAS-write. Retry on conflict. Requires adjacency lists stored as immutable versioned snapshots. Estimated effort: high. Only needed if per-node locking is insufficient.
-
-4. **Sharded graph engines** — Partition the graph across N `GraphEngine` instances, each with its own storage and mutex. Route mutations by source node hash. Cross-shard edges require a 2PC protocol. Estimated effort: high. This is the path to distributed graph.
-
-### 13.4 Recommended Approach for 100K Agents
-
-For the typical GraphRAG workload (bulk load at build time, infrequent learned edge writes, read-heavy traversals):
-
-- The single mutex is sufficient through ~10K agents
-- Per-node locking + write batching gets to ~100K agents
-- Sharded engines only needed if write volume exceeds what a single RocksDB instance can handle (~100K writes/second)
-
----
-
-## 14. Open Questions
-
-1. **Bulk loading API.** Should there be a batch `add_nodes` / `add_edges` that optimizes for initial graph population (skip adjacency updates until flush)?
+1. **Bulk loading API.** Should there be a batch `add_nodes` / `add_edges` that optimizes for initial graph population?
 2. **Schema migration tooling.** What does `alter_node_type` or `add_property_to_existing_type` look like operationally?
-3. **Subgraph caching.** For hot subgraphs that many agents request, should there be an in-memory cache layer? Node hotness tracking (11.5) provides the signal — the caching strategy is TBD.
-4. **Graph-level embeddings.** Should the engine support computing aggregate embeddings over subgraphs (e.g., a table's embedding = f(table embedding, column embeddings))?
-5. **MCP tool integration.** Should the graph API expose itself as an MCP server for direct agent tool calling?
-6. **Learned edge conflict resolution.** If two agents write conflicting learned edges (e.g., different confidence scores for the same relationship), what wins? Last-write-wins, highest confidence, or merge?
-7. **Multi-graph queries.** Should an agent be able to traverse across multiple graphs (e.g., a data catalog graph + an access control graph)?
-8. **Tombstone TTL configuration.** Per-graph? Per-node-type? Global default with overrides?
+3. **Subgraph caching.** For hot subgraphs that many agents request, should there be an in-memory cache layer?
+4. **MCP tool integration.** Should the graph API expose itself as an MCP server for direct agent tool calling?
+5. **Multi-graph queries.** Should an agent be able to traverse across multiple graphs?
+6. **Index storage format.** For high-cardinality fields, protobuf lists are fine. For low-cardinality fields mapping to millions of IDs, consider roaring bitmaps.

@@ -1606,24 +1606,34 @@ Result<DocPtrMap> CollectionImpl::Fetch(
 
   DocPtrMap results;
 
-  for (auto &pk : pks) {
-    uint64_t doc_id;
-    bool has = id_map_->has(pk, &doc_id);
-    if (!has) {
+  // Batch-resolve all primary keys to doc_ids via a single RocksDB MultiGet
+  // instead of N individual Get calls.
+  std::vector<uint64_t> doc_ids;
+  auto mg_status = id_map_->multi_get(pks, &doc_ids);
+  if (!mg_status.ok()) {
+    // Fallback: if multi_get fails (e.g. empty input), insert nulls
+    for (auto &pk : pks) {
       results.insert({pk, nullptr});
+    }
+    return results;
+  }
+
+  for (size_t i = 0; i < pks.size(); ++i) {
+    if (doc_ids[i] == INVALID_DOC_ID) {
+      results.insert({pks[i], nullptr});
       continue;
     }
-    if (delete_store_->is_deleted(doc_id)) {
-      results.insert({pk, nullptr});
+    if (delete_store_->is_deleted(doc_ids[i])) {
+      results.insert({pks[i], nullptr});
       continue;
     }
-    auto segment = local_segment_by_doc_id(doc_id, segments);
+    auto segment = local_segment_by_doc_id(doc_ids[i], segments);
     if (!segment) {
-      LOG_WARN("doc_id: %zu segment not found", (size_t)doc_id);
-      results.insert({pk, nullptr});
+      LOG_WARN("doc_id: %zu segment not found", (size_t)doc_ids[i]);
+      results.insert({pks[i], nullptr});
       continue;
     }
-    results.insert({pk, segment->Fetch(doc_id)});
+    results.insert({pks[i], segment->Fetch(doc_ids[i])});
   }
 
   return results;

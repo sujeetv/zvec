@@ -30,65 +30,65 @@
 namespace zvec {
 namespace graph {
 
-//! Unified entry point for the property graph engine.
+//! A graph collection backed by a RocksDB KV store.
 //!
-//! Owns schema, storage, mutation engine, and traversal engine.
-//! Provides create/open/destroy lifecycle plus all graph operations.
-class GraphEngine {
+//! Replaces GraphEngine with a storage-optimized implementation for
+//! concurrent agent access. All data lives in RocksDB column families;
+//! vector embeddings are stored separately in zvec Collections.
+class GraphCollection {
  public:
-  //! Create a new graph at the given path with the specified schema.
-  static std::unique_ptr<GraphEngine> Create(const std::string& path,
-                                             const GraphSchema& schema);
+  //! Create a new graph collection at the given path.
+  static std::unique_ptr<GraphCollection> Create(const std::string& path,
+                                                  const GraphSchema& schema);
 
-  //! Open an existing graph from disk.
-  static std::unique_ptr<GraphEngine> Open(const std::string& path);
+  //! Open an existing graph collection from disk.
+  static std::unique_ptr<GraphCollection> Open(const std::string& path);
 
-  //! Destroy the graph (delete all storage and metadata).
+  //! Destroy the collection and all data.
   void Destroy();
 
-  //! Repair orphaned adjacency references (stub for future enhancement).
-  Status Repair();
+  //! Flush pending writes to disk.
+  Status Flush();
 
   //! Get the graph schema.
   const GraphSchema& GetSchema() const;
 
   // --- Node operations ---
 
-  //! Add a node to the graph (validates against schema).
   Status AddNode(const GraphNode& node);
-
-  //! Remove a node and cascade-delete all connected edges.
   Status RemoveNode(const std::string& node_id);
-
-  //! Update specific properties on an existing node.
   Status UpdateNode(
       const std::string& node_id,
       const std::unordered_map<std::string, std::string>& properties);
-
-  //! Fetch nodes by their IDs.
   std::vector<GraphNode> FetchNodes(const std::vector<std::string>& ids);
+  std::vector<GraphNode> FilterNodes(const std::string& filter_expr,
+                                     int limit = 1000);
 
   // --- Edge operations ---
 
-  //! Add an edge between two existing nodes (validates against schema).
   Status AddEdge(
       const std::string& source_id, const std::string& target_id,
       const std::string& edge_type,
       const std::unordered_map<std::string, std::string>& properties);
-
-  //! Remove an edge and clean up adjacency lists.
   Status RemoveEdge(const std::string& edge_id);
-
-  //! Fetch edges by their IDs.
+  Status UpdateEdge(
+      const std::string& edge_id,
+      const std::unordered_map<std::string, std::string>& properties);
   std::vector<GraphEdge> FetchEdges(const std::vector<std::string>& ids);
+  std::vector<GraphEdge> FilterEdges(const std::string& filter_expr,
+                                     int limit = 1000);
 
   // --- Traversal ---
 
-  //! Perform a multi-hop BFS traversal.
   Subgraph Traverse(const TraversalParams& params);
 
+  // --- Index operations ---
+
+  Status CreateIndex(const std::string& entity, const std::string& field);
+  Status DropIndex(const std::string& entity, const std::string& field);
+
  private:
-  GraphEngine() = default;
+  GraphCollection() = default;
 
   std::string path_;
   std::unique_ptr<GraphSchema> schema_;

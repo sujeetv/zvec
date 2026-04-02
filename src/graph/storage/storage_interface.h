@@ -94,6 +94,13 @@ class StorageInterface {
   virtual Result<std::vector<GraphNode>> FetchNodes(
       const std::vector<std::string>& node_ids) = 0;
 
+  //! Fetch nodes without deserializing vector fields (faster for traversal).
+  //! Default implementation falls back to FetchNodes.
+  virtual Result<std::vector<GraphNode>> FetchNodesLite(
+      const std::vector<std::string>& node_ids) {
+    return FetchNodes(node_ids);
+  }
+
   //! Return all nodes matching a filter expression (e.g. "node_type = 'table'").
   virtual Result<std::vector<GraphNode>> FilterNodes(
       const std::string& filter_expr, int limit = 1000) = 0;

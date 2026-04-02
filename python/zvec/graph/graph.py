@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from _zvec import _GraphEngine, _GraphNode, _TraversalParams
+from _zvec import _GraphCollection, _GraphNode, _TraversalParams
 
 from .schema import GraphSchema
 from .types import GraphEdge, GraphNode, Subgraph
@@ -24,7 +24,7 @@ __all__ = ["Graph"]
 
 
 class Graph:
-    """Python wrapper around the C++ GraphEngine.
+    """Python wrapper around the C++ GraphCollection.
 
     Use the :meth:`create` or :meth:`open` class methods to obtain an
     instance.  Do not instantiate directly.
@@ -32,7 +32,7 @@ class Graph:
 
     __slots__ = ("_engine",)
 
-    def __init__(self, engine: _GraphEngine) -> None:
+    def __init__(self, engine: _GraphCollection) -> None:
         self._engine = engine
 
     @classmethod
@@ -49,7 +49,7 @@ class Graph:
         Raises:
             RuntimeError: If creation fails (e.g., path already exists).
         """
-        engine = _GraphEngine.Create(path, schema._get_cpp_schema())
+        engine = _GraphCollection.Create(path, schema._get_cpp_schema())
         return cls(engine)
 
     @classmethod
@@ -65,7 +65,7 @@ class Graph:
         Raises:
             RuntimeError: If the graph cannot be opened.
         """
-        engine = _GraphEngine.Open(path)
+        engine = _GraphCollection.Open(path)
         return cls(engine)
 
     # --- Node operations ---
@@ -222,6 +222,58 @@ class Graph:
         """
         self._engine.Destroy()
 
-    def repair(self) -> None:
-        """Repair orphaned adjacency references."""
-        self._engine.Repair()
+    def flush(self) -> None:
+        """Flush pending writes to disk."""
+        self._engine.Flush()
+
+    def filter_nodes(
+        self,
+        filter_expr: str,
+        limit: int = 1000,
+    ) -> list[GraphNode]:
+        """Filter nodes by expression (e.g., "node_type = 'table'").
+
+        Args:
+            filter_expr: Filter expression.
+            limit: Maximum number of results.
+
+        Returns:
+            List of matching nodes.
+        """
+        results = self._engine.FilterNodes(filter_expr, limit)
+        return [GraphNode(r) for r in results]
+
+    def filter_edges(
+        self,
+        filter_expr: str,
+        limit: int = 1000,
+    ) -> list[GraphEdge]:
+        """Filter edges by expression (e.g., "edge_type = 'has_column'").
+
+        Args:
+            filter_expr: Filter expression.
+            limit: Maximum number of results.
+
+        Returns:
+            List of matching edges.
+        """
+        results = self._engine.FilterEdges(filter_expr, limit)
+        return [GraphEdge(r) for r in results]
+
+    def create_index(self, entity: str, field: str) -> None:
+        """Create a secondary index on a field.
+
+        Args:
+            entity: "nodes" or "edges".
+            field: Field name to index.
+        """
+        self._engine.CreateIndex(entity, field)
+
+    def drop_index(self, entity: str, field: str) -> None:
+        """Drop a secondary index.
+
+        Args:
+            entity: "nodes" or "edges".
+            field: Field name.
+        """
+        self._engine.DropIndex(entity, field)

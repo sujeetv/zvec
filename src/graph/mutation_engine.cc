@@ -94,13 +94,15 @@ Status MutationEngine::RemoveNode(const std::string& node_id) {
 
       // Check if there are still other edges connecting to node_id
       bool still_connected = false;
-      for (const auto& eid : other.neighbor_edge_ids) {
-        auto e_result = storage_->FetchEdges({eid});
-        if (e_result.has_value() && !e_result.value().empty()) {
-          const auto& e = e_result.value()[0];
-          if (e.source_id == node_id || e.target_id == node_id) {
-            still_connected = true;
-            break;
+      if (!other.neighbor_edge_ids.empty()) {
+        auto batch_edges =
+            storage_->FetchEdges(other.neighbor_edge_ids);
+        if (batch_edges.has_value()) {
+          for (const auto& e : batch_edges.value()) {
+            if (e.source_id == node_id || e.target_id == node_id) {
+              still_connected = true;
+              break;
+            }
           }
         }
       }
@@ -256,13 +258,16 @@ Status MutationEngine::RemoveEdge(const std::string& edge_id) {
 
     // Only remove neighbor_id if no other edges connect to the same target
     bool still_connected = false;
-    for (const auto& eid : source.neighbor_edge_ids) {
-      auto e_result = storage_->FetchEdges({eid});
-      if (e_result.has_value() && !e_result.value().empty()) {
-        const auto& e = e_result.value()[0];
-        if (e.source_id == edge.target_id || e.target_id == edge.target_id) {
-          still_connected = true;
-          break;
+    if (!source.neighbor_edge_ids.empty()) {
+      auto batch_edges =
+          storage_->FetchEdges(source.neighbor_edge_ids);
+      if (batch_edges.has_value()) {
+        for (const auto& e : batch_edges.value()) {
+          if (e.source_id == edge.target_id ||
+              e.target_id == edge.target_id) {
+            still_connected = true;
+            break;
+          }
         }
       }
     }
@@ -288,13 +293,16 @@ Status MutationEngine::RemoveEdge(const std::string& edge_id) {
 
     // Only remove neighbor_id if no other edges connect to the same source
     bool still_connected = false;
-    for (const auto& eid : target.neighbor_edge_ids) {
-      auto e_result = storage_->FetchEdges({eid});
-      if (e_result.has_value() && !e_result.value().empty()) {
-        const auto& e = e_result.value()[0];
-        if (e.source_id == edge.source_id || e.target_id == edge.source_id) {
-          still_connected = true;
-          break;
+    if (!target.neighbor_edge_ids.empty()) {
+      auto batch_edges =
+          storage_->FetchEdges(target.neighbor_edge_ids);
+      if (batch_edges.has_value()) {
+        for (const auto& e : batch_edges.value()) {
+          if (e.source_id == edge.source_id ||
+              e.target_id == edge.source_id) {
+            still_connected = true;
+            break;
+          }
         }
       }
     }

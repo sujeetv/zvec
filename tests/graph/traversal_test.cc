@@ -15,6 +15,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -22,7 +23,7 @@
 
 #include "graph/graph_schema.h"
 #include "graph/mutation_engine.h"
-#include "graph/storage/zvec_storage.h"
+#include "graph/storage/graph_kv_store.h"
 #include "graph/traversal.h"
 
 using namespace zvec;
@@ -31,7 +32,7 @@ using namespace zvec::graph;
 class TraversalTest : public testing::Test {
  protected:
   static std::string test_dir_;
-  std::unique_ptr<ZvecStorage> storage_;
+  std::unique_ptr<GraphKVStore> storage_;
   std::unique_ptr<MutationEngine> mutation_;
   std::unique_ptr<TraversalEngine> traversal_;
   GraphSchema schema_;
@@ -39,7 +40,7 @@ class TraversalTest : public testing::Test {
   TraversalTest() : schema_("test_graph") {}
 
   void SetUp() override {
-    system(("rm -rf " + test_dir_).c_str());
+    std::filesystem::remove_all(test_dir_);
 
     NodeTypeBuilder nb("table");
     nb.AddProperty("database", zvec::proto::DT_STRING, false);
@@ -62,7 +63,7 @@ class TraversalTest : public testing::Test {
     EdgeTypeBuilder eb3("learned", false);
     schema_.AddEdgeType(eb3.Build());
 
-    storage_ = ZvecStorage::Create(test_dir_, schema_);
+    storage_ = GraphKVStore::Create(test_dir_);
     ASSERT_NE(storage_, nullptr);
     mutation_ = std::make_unique<MutationEngine>(&schema_, storage_.get());
     traversal_ = std::make_unique<TraversalEngine>(storage_.get());
@@ -113,7 +114,7 @@ class TraversalTest : public testing::Test {
     traversal_.reset();
     mutation_.reset();
     storage_.reset();
-    system(("rm -rf " + test_dir_).c_str());
+    std::filesystem::remove_all(test_dir_);
   }
 };
 

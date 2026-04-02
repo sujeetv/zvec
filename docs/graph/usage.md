@@ -1,4 +1,10 @@
-# zvec Graph Engine -- Python API Examples
+# zvec Graph Engine — Usage Guide
+
+This guide covers the Python API for creating and working with property
+graphs in zvec. All examples use the current `Graph` API backed by the
+RocksDB KV store.
+
+---
 
 ## 1. Define a Schema
 
@@ -12,7 +18,6 @@ from zvec.graph import (
     EdgeType,
     EdgeConstraint,
     PropertyDef,
-    VectorDef,
 )
 
 schema = GraphSchema(
@@ -24,18 +29,12 @@ schema = GraphSchema(
                 PropertyDef("database", "string"),
                 PropertyDef("row_count", "int64", nullable=True),
             ],
-            vectors=[
-                VectorDef("desc_emb", "vector_fp32", dimension=768),
-            ],
         ),
         NodeType(
             name="column",
             properties=[
                 PropertyDef("data_type", "string"),
                 PropertyDef("nullable", "bool"),
-            ],
-            vectors=[
-                VectorDef("desc_emb", "vector_fp32", dimension=768),
             ],
         ),
     ],
@@ -55,7 +54,7 @@ schema = GraphSchema(
     edge_constraints=[
         EdgeConstraint("has_column", source="table", target="column"),
         EdgeConstraint("foreign_key", source="table", target="table"),
-        # No constraint on learned_similarity -- any node pair allowed
+        # No constraint on learned_similarity — any node pair allowed
     ],
 )
 ```
@@ -69,13 +68,13 @@ schema = GraphSchema(
 ## 2. Create and Open a Graph
 
 ```python
-import zvec
+from zvec.graph import Graph
 
 # Create a new graph on disk
-graph = zvec.create_graph(path="/data/my_catalog", schema=schema)
+graph = Graph.create(path="/data/my_catalog", schema=schema)
 
 # Later, reopen the same graph (schema is restored from disk)
-graph = zvec.open_graph(path="/data/my_catalog")
+graph = Graph.open(path="/data/my_catalog")
 ```
 
 ---
@@ -83,7 +82,7 @@ graph = zvec.open_graph(path="/data/my_catalog")
 ## 3. Add Nodes
 
 ```python
-# Simple node with scalar properties
+# Node with scalar properties
 graph.add_node(
     id="orders",
     node_type="table",
@@ -149,47 +148,19 @@ graph.add_edge(
 **Edge IDs** are deterministic: `source--edge_type--target`
 (e.g., `orders--has_column--orders.customer_id`).
 
-**Adding the same edge twice is idempotent** -- it succeeds without
+**Adding the same edge twice is idempotent** — it succeeds without
 creating duplicates.
 
 **Constraint enforcement:**
 
 ```python
 graph.add_edge(source="col1", target="col2", edge_type="has_column")
-# ValueError: constraint violation -- has_column requires table -> column
+# ValueError: constraint violation — has_column requires table -> column
 ```
 
 ---
 
-## 5. Fetch Nodes and Edges
-
-```python
-# Fetch a single node
-node = graph.fetch_node("orders")
-if node:
-    print(node.id)              # "orders"
-    print(node.node_type)       # "table"
-    print(node.properties)      # {"database": "analytics", "row_count": "1000000"}
-    print(node.neighbor_ids)    # ["orders.customer_id", "customers", ...]
-    print(node.version)         # 1
-    print(node.updated_at)      # epoch milliseconds
-
-# Returns None if not found
-node = graph.fetch_node("nonexistent")  # None
-
-# Fetch an edge by its deterministic ID
-edge = graph.fetch_edge("orders--has_column--orders.customer_id")
-if edge:
-    print(edge.source_id)   # "orders"
-    print(edge.target_id)   # "orders.customer_id"
-    print(edge.edge_type)   # "has_column"
-    print(edge.directed)    # True
-    print(edge.properties)  # {}
-```
-
----
-
-## 6. Update Nodes
+## 5. Update Nodes
 
 Updates merge new properties into existing ones and bump the version.
 
@@ -203,7 +174,7 @@ print(node.version)                  # 2
 
 ---
 
-## 7. Remove Nodes and Edges
+## 6. Remove Nodes and Edges
 
 Removing an edge cleans up adjacency lists on both connected nodes.
 
@@ -233,7 +204,84 @@ assert "orders" not in customers.neighbor_ids
 
 ---
 
-## 8. Traverse the Graph
+## 7. Create Secondary Indexes
+
+The graph engine automatically creates indexes on `node_type`,
+`source_id`, `target_id`, and `edge_type`. You can create additional
+indexes on any property field to speed up filter queries.
+
+```python
+# Index a node property
+graph.create_index("nodes", "database")
+
+# Index an edge property
+graph.create_index("edges", "on_column")
+
+# Drop an index when no longer needed
+graph.drop_index("nodes", "database")
+```
+
+Indexes are backed by RocksDB column families with merge operators for
+efficient maintenance. Creating an index backfills all existing data.
+
+---
+
+## 8. Fetch Nodes and Edges
+
+```python
+# Fetch a single node by ID
+node = graph.fetch_node("orders")
+if node:
+    print(node.id)              # "orders"
+    print(node.node_type)       # "table"
+    print(node.properties)      # {"database": "analytics", "row_count": "1000000"}
+    print(node.neighbor_ids)    # ["orders.customer_id", "customers", ...]
+    print(node.version)         # 1
+    print(node.updated_at)      # epoch milliseconds
+
+# Returns None if not found
+node = graph.fetch_node("nonexistent")  # None
+
+# Fetch an edge by its deterministic ID
+edge = graph.fetch_edge("orders--has_column--orders.customer_id")
+if edge:
+    print(edge.source_id)   # "orders"
+    print(edge.target_id)   # "orders.customer_id"
+    print(edge.edge_type)   # "has_column"
+    print(edge.directed)    # True
+    print(edge.properties)  # {}
+```
+
+---
+
+## 9. Filter Nodes and Edges
+
+Filter queries use the format `field = 'value'`. Multiple conditions
+can be combined with `AND`.
+
+```python
+# Filter nodes by type
+tables = graph.filter_nodes("node_type = 'table'")
+
+# Filter nodes by property (faster with an index on "database")
+analytics_tables = graph.filter_nodes("node_type = 'table' AND database = 'analytics'")
+
+# Filter edges by type
+fk_edges = graph.filter_edges("edge_type = 'foreign_key'")
+
+# Filter edges by source
+edges_from_orders = graph.filter_edges("source_id = 'orders'")
+
+# Limit results
+top_10 = graph.filter_nodes("node_type = 'table'", limit=10)
+```
+
+Filters on indexed fields (auto or user-created) use index lookups.
+Non-indexed fields fall back to a full scan.
+
+---
+
+## 10. Traverse the Graph
 
 Traversal performs a multi-hop BFS from seed nodes, collecting the
 neighborhood into a `Subgraph`.
@@ -255,7 +303,6 @@ sg = graph.traverse(start=["orders", "customers"], depth=1)
 Only follow certain edge types during traversal.
 
 ```python
-# Only follow has_column edges, skip foreign_key
 sg = graph.traverse(
     start="orders",
     depth=2,
@@ -284,12 +331,12 @@ Cap the result size to prevent overwhelming LLM context windows.
 ```python
 sg = graph.traverse(start="orders", depth=3, max_nodes=50)
 if sg.truncated:
-    print("Result was truncated -- increase max_nodes for more context")
+    print("Result was truncated — increase max_nodes for more context")
 ```
 
 ---
 
-## 9. Inspect Subgraph Results
+## 11. Inspect Subgraph Results
 
 `Subgraph` provides convenience methods for filtering and serialization.
 
@@ -312,7 +359,7 @@ print(sg.truncated)  # False
 
 ---
 
-## 10. Serialize for Agent Consumption
+## 12. Serialize for Agent Consumption
 
 Two output formats optimized for different agent workflows.
 
@@ -320,8 +367,8 @@ Two output formats optimized for different agent workflows.
 
 ```python
 json_str = sg.to_json()
-# {"nodes":[{"id":"orders","node_type":"table","properties":{"database":"analytics"}}, ...],
-#  "edges":[{"id":"orders--has_column--orders.customer_id","source_id":"orders", ...}],
+# {"nodes":[{"id":"orders","node_type":"table","properties":{...}}, ...],
+#  "edges":[{"id":"orders--has_column--orders.customer_id", ...}],
 #  "truncated":false}
 ```
 
@@ -345,18 +392,16 @@ text = sg.to_text()
 
 ---
 
-## 11. GraphRAG Workflow (End-to-End)
+## 13. GraphRAG Workflow (End-to-End)
 
 The full pattern: natural language question -> vector search for seed
 entities -> graph traversal for context -> feed to LLM.
 
 ```python
-import zvec
-from zvec.graph import *
+from zvec.graph import Graph
 
-# Assume graph is already created and populated with embeddings
-
-graph = zvec.open_graph("/data/my_catalog")
+# Assume graph is already created and populated
+graph = Graph.open("/data/my_catalog")
 
 # Step 1: Embed the user's question
 query_embedding = your_embedding_model.encode(
@@ -364,14 +409,11 @@ query_embedding = your_embedding_model.encode(
 )
 
 # Step 2: Vector search for relevant tables
-# (requires HNSW index on desc_emb -- see below)
-seeds = graph.search_nodes(
-    vector=query_embedding,
-    vector_field="desc_emb",
-    topk=3,
-    filter="node_type = 'table'",
-)
-seed_ids = [n.id for n in seeds]
+# (uses a separate zvec Collection with HNSW index)
+import zvec
+vec_col = zvec.Collection.open("path/to/table_embeddings")
+results = vec_col.query(vector=query_embedding, topk=5)
+seed_ids = [r.id for r in results]
 # e.g., ["orders", "customers", "segments"]
 
 # Step 3: Traverse to gather schema context
@@ -394,31 +436,31 @@ response = your_llm.generate(prompt)
 
 ---
 
-## 12. Graph Lifecycle
+## 14. Graph Lifecycle
 
 ```python
-# Repair orphaned adjacency references (after crash recovery)
-graph.repair()
+# Flush pending writes to disk
+graph.flush()
 
-# Destroy a graph permanently (irreversible)
+# Destroy a graph permanently (irreversible!)
 graph.destroy()
 ```
 
 ---
 
-## 13. Data Type Reference
+## 15. Data Type Reference
 
-| Python string | Proto enum    | Use case                    |
-|---------------|---------------|-----------------------------|
-| `"string"`    | `DT_STRING`   | Text properties             |
-| `"bool"`      | `DT_BOOL`     | Boolean flags               |
-| `"int32"`     | `DT_INT32`    | Small integers              |
-| `"int64"`     | `DT_INT64`    | Large integers, row counts  |
-| `"uint32"`    | `DT_UINT32`   | Unsigned integers           |
-| `"uint64"`    | `DT_UINT64`   | Timestamps, versions        |
-| `"float"`     | `DT_FLOAT`    | Single-precision floats     |
-| `"double"`    | `DT_DOUBLE`   | Confidence scores           |
-| `"vector_fp32"` | `DT_VECTOR_FP32` | Standard embeddings    |
-| `"vector_fp64"` | `DT_VECTOR_FP64` | High-precision vectors |
-| `"vector_fp16"` | `DT_VECTOR_FP16` | Memory-efficient vectors |
-| `"vector_int8"` | `DT_VECTOR_INT8` | Quantized vectors      |
+| Python string   | Proto enum        | Use case                    |
+|-----------------|-------------------|-----------------------------|
+| `"string"`      | `DT_STRING`       | Text properties             |
+| `"bool"`        | `DT_BOOL`         | Boolean flags               |
+| `"int32"`       | `DT_INT32`        | Small integers              |
+| `"int64"`       | `DT_INT64`        | Large integers, row counts  |
+| `"uint32"`      | `DT_UINT32`       | Unsigned integers           |
+| `"uint64"`      | `DT_UINT64`       | Timestamps, versions        |
+| `"float"`       | `DT_FLOAT`        | Single-precision floats     |
+| `"double"`      | `DT_DOUBLE`       | Confidence scores           |
+| `"vector_fp32"` | `DT_VECTOR_FP32`  | Standard embeddings         |
+| `"vector_fp64"` | `DT_VECTOR_FP64`  | High-precision vectors      |
+| `"vector_fp16"` | `DT_VECTOR_FP16`  | Memory-efficient vectors    |
+| `"vector_int8"` | `DT_VECTOR_INT8`  | Quantized vectors           |

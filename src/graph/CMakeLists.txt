@@ -22,7 +22,7 @@ cc_library(
     NAME zvec_graph STATIC STRICT
     SRCS ${ALL_GRAPH_SRCS}
     INCS . ${PROJECT_ROOT_DIR}/src ${CMAKE_CURRENT_BINARY_DIR}
-    LIBS zvec_db zvec_graph_proto libprotobuf
+    LIBS zvec_db zvec_graph_proto libprotobuf rocksdb
     VERSION "${PROXIMA_ZVEC_VERSION}"
     DEPS zvec_graph_proto
 )
